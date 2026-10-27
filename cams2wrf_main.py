@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 
 import regridding_utils
@@ -256,10 +257,33 @@ if args.do_BC:
     for date in dates_to_process:
         print("\n\tBCs, next date: {}".format(date))
 
-        fp = args.reanalysis_dir + args.reanalysis_file_name_template.format(date_time=date.strftime('%Y%m%d'), stream='ml')
-        donor_ml_ds = xr_open_dataset_impl(fp).sel(time=date, method='nearest')
-        fp = args.reanalysis_dir + args.reanalysis_file_name_template.format(date_time=date.strftime('%Y%m%d'), stream='sfc')
-        donor_sfc_ds = xr_open_dataset_impl(fp).sel(time=date, method='nearest')
+        time_index_in_wrfbdy = wrf_bdy_dates.get_loc(date)
+
+        fp_ml = args.reanalysis_dir + args.reanalysis_file_name_template.format(date_time=date.strftime('%Y%m%d'), stream='ml')
+        fp_sfc = args.reanalysis_dir + args.reanalysis_file_name_template.format(date_time=date.strftime('%Y%m%d'), stream='sfc')
+
+        # Fallback / Boundary persistence when donor file for subsequent dates is not available
+        if not os.path.exists(fp_ml) or not os.path.exists(fp_sfc):
+            if prev_time_index is not None:
+                print("\t[NOTICE] Donor file {} not found. Reusing boundary concentrations from previous time index {}.".format(fp_ml, prev_time_index))
+                for wrf_key in unique_wrf_keys:
+                    if wrf_key + "_BXS" in wrfbdy_f.variables:
+                        wrfbdy_f.variables[wrf_key + "_BXS"][time_index_in_wrfbdy, :] = wrfbdy_f.variables[wrf_key + "_BXS"][prev_time_index, :]
+                        wrfbdy_f.variables[wrf_key + "_BXE"][time_index_in_wrfbdy, :] = wrfbdy_f.variables[wrf_key + "_BXE"][prev_time_index, :]
+                        wrfbdy_f.variables[wrf_key + "_BYS"][time_index_in_wrfbdy, :] = wrfbdy_f.variables[wrf_key + "_BYS"][prev_time_index, :]
+                        wrfbdy_f.variables[wrf_key + "_BYE"][time_index_in_wrfbdy, :] = wrfbdy_f.variables[wrf_key + "_BYE"][prev_time_index, :]
+                print('Prescribing uniform tendency in BC for these fields: {}'.format(unique_wrf_keys))
+                for wrf_key in unique_wrf_keys:
+                    if wrf_key + "_BXS" in wrfbdy_f.variables:
+                        regridding_utils.update_tendency_boundaries(wrfbdy_f, wrf_key, time_index_in_wrfbdy, delta_t)
+                prev_time_index = time_index_in_wrfbdy
+                print("--- %s seconds ---" % (time.time() - start_time))
+                continue
+            else:
+                raise FileNotFoundError("Initial donor file {} not found.".format(fp_ml))
+
+        donor_ml_ds = xr_open_dataset_impl(fp_ml).sel(time=date, method='nearest')
+        donor_sfc_ds = xr_open_dataset_impl(fp_sfc).sel(time=date, method='nearest')
         derive_cams_pressure_profile(donor_ml_ds, donor_sfc_ds)
 
         met_file_name = regridding_utils.get_met_file_by_time(date.strftime(args.wrf_met_files_date_format), args.wrf_met_files_name_template)
@@ -273,8 +297,6 @@ if args.do_BC:
         wrf_met_ds['p_rho_on_bnd'] = flatten_and_line_up_boundaries(wrf_met_ds.p_rho)  # concatenate east, west, nort and south boundaries
         wrf_met_ds['boundary_lons'] = flatten_and_line_up_boundaries(wrf_met_ds.XLONG_M)
         wrf_met_ds['boundary_lats'] = flatten_and_line_up_boundaries(wrf_met_ds.XLAT_M)
-
-        time_index_in_wrfbdy = wrf_bdy_dates.get_loc(date)
 
         donor_time_val = str(donor_ml_ds.time.values) if 'time' in donor_ml_ds.coords else (str(donor_ml_ds.valid_time.values) if 'valid_time' in donor_ml_ds.coords else None)
         is_same_as_prev = (
