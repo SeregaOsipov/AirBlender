@@ -14,7 +14,14 @@ def get_cams2wrf_mapping():
 
 
     ml_stream = 'ml'
+    ghg_stream = 'ghg'
     mappings = [
+        # --- Greenhouse Gases (High-res 0.1 deg CAMS GHG stream; falls back to ml for ch4) ---
+        # Carbon Dioxide: 28.97 / 44.01
+        IcBcMappingItem('co2 -> 0.6582*[co2];1.e6', ghg_stream),
+        # Methane: 28.97 / 16.043
+        IcBcMappingItem('ch4 -> 1.8058*[ch4];1.e6', ghg_stream),
+
         # --- Inorganics (Gases) ---
         # Ozone: 28.97 / 48.0
         IcBcMappingItem('o3 -> 0.604*[go3];1.e6', ml_stream),
@@ -30,8 +37,6 @@ def get_cams2wrf_mapping():
         IcBcMappingItem('hno3 -> 0.460*[hno3];1.e6', ml_stream),
         # Hydrogen Peroxide: 28.97 / 34.01
         IcBcMappingItem('h2o2 -> 0.852*[h2o2];1.e6', ml_stream),
-        # Methane: 28.97 / 16.04
-        IcBcMappingItem('ch4 -> 1.806*[ch4_c];1.e6', ml_stream),
         # Ammonia: 28.97 / 17.03
         IcBcMappingItem('nh3 -> 1.701*[nh3];1.e6', ml_stream),
         # Organic Nitrates (ONIT): 28.97 / 119.0 (assuming average weight for RADM2 lumping)

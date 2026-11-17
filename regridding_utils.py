@@ -21,15 +21,47 @@ def hor_interpolate_3d_field_on_wrf_boundary(donor_var_da, wrf_met_ds):
     return field_bnd_da
 
 
+def _ver_interpolate_edge_clamped(donor_var_da, donor_p_rho_da, wrf_p_rho_da):
+    """
+    Linearly interpolate 3D or boundary-unraveled donor columns onto WRF pressure
+    levels with boundary clamping (nearest edge level outside donor pressure bounds)
+    so long-lived species never drop to 0 near surface/top levels.
+    """
+    donor_vdim = 'level' if 'level' in donor_var_da.dims else donor_var_da.dims[0]
+    wrf_vdim = 'bottom_top' if 'bottom_top' in wrf_p_rho_da.dims else wrf_p_rho_da.dims[0]
+
+    other_dims = tuple(d for d in wrf_p_rho_da.dims if d != wrf_vdim)
+    wrf_p_bt = wrf_p_rho_da.transpose(wrf_vdim, *other_dims)
+    donor_p_bt = donor_p_rho_da.transpose(donor_vdim, *other_dims)
+    donor_v_bt = donor_var_da.transpose(donor_vdim, *other_dims)
+
+    p_wrf = np.asarray(wrf_p_bt.values, dtype=np.float64).reshape(wrf_p_bt.shape[0], -1)
+    p_don = np.asarray(donor_p_bt.values, dtype=np.float64).reshape(donor_p_bt.shape[0], -1)
+    v_don = np.asarray(donor_v_bt.values, dtype=np.float64).reshape(donor_v_bt.shape[0], -1)
+
+    out = np.empty_like(p_wrf)
+    for col in range(p_wrf.shape[1]):
+        xp = p_don[:, col]
+        fp = v_don[:, col]
+        if xp[0] > xp[-1]:
+            xp = xp[::-1]
+            fp = fp[::-1]
+        elif not np.all(np.diff(xp) >= 0):
+            order = np.argsort(xp)
+            xp = xp[order]
+            fp = fp[order]
+        out[:, col] = np.interp(p_wrf[:, col], xp, fp)
+
+    out_da = xr.DataArray(
+        out.reshape(wrf_p_bt.shape),
+        dims=wrf_p_bt.dims,
+        coords=wrf_p_bt.coords,
+    ).transpose(*wrf_p_rho_da.dims).astype(wrf_p_rho_da.dtype).rename('diag')
+    return out_da
+
+
 def ver_interpolate_3d_field_on_wrf_boundary(donor_var_da, donor_p_rho_da, wrf_p_rho_da):
-    wrf_hvi_da = xr.full_like(wrf_p_rho_da, fill_value=0).rename('diag')
-    wrf_hvi_da.attrs.clear()
-
-    for boundary_point_index, boundary_point in enumerate(wrf_p_rho_da.boundary_points):
-        f = interpolate.interp1d(donor_p_rho_da.isel(boundary_points=boundary_point_index), donor_var_da.isel(boundary_points=boundary_point_index), kind='linear', bounds_error=False, fill_value=0)
-        wrf_hvi_da.isel(boundary_points=boundary_point_index)[:] = f(wrf_p_rho_da.isel(boundary_points=boundary_point_index))
-
-    return wrf_hvi_da
+    return _ver_interpolate_edge_clamped(donor_var_da, donor_p_rho_da, wrf_p_rho_da)
 
 
 def hor_interpolate_3d_field_on_wrf_grid(donor_var_da, wrf_grid_ds):  #, wrf_ny, wrf_nx, wrf_lon, wrf_lat):
@@ -47,14 +79,7 @@ def hor_interpolate_3d_field_on_wrf_grid(donor_var_da, wrf_grid_ds):  #, wrf_ny,
 
 
 def ver_interpolate_3d_field_on_wrf_grid(donor_var_da, donor_p_rho_da, wrf_p_rho_da):
-    wrf_hvi_da = xr.full_like(wrf_p_rho_da, fill_value=0).rename('diag')
-    wrf_hvi_da.attrs.clear()
-
-    for lat_index, lon_index in itertools.product(range(wrf_p_rho_da.south_north.size), range(wrf_p_rho_da.west_east.size)):  # This creates a single loop that visits every grid cell
-        f = interpolate.interp1d(donor_p_rho_da.isel(south_north=lat_index, west_east=lon_index), donor_var_da.isel(south_north=lat_index, west_east=lon_index), kind='linear', bounds_error=False, fill_value=0)
-        wrf_hvi_da.isel(south_north=lat_index, west_east=lon_index)[:] = f(wrf_p_rho_da.isel(south_north=lat_index, west_east=lon_index))
-
-    return wrf_hvi_da
+    return _ver_interpolate_edge_clamped(donor_var_da, donor_p_rho_da, wrf_p_rho_da)
 
 
 def update_tendency_boundaries(wrfbdy_f, name, index, dt):
