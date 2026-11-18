@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airblender"
+version = "0.2.0"
+description = "Unified atmospheric meteorology, chemistry, and aerosol coupler (CAMS/MERRA-2/EMAC -> WPS/WRF-Chem -> PALM-4U)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Sergey Osipov", email = "Serega.Osipov@gmail.com" },
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "xarray",
+    "netCDF4",
+    "pandas",
+    "pyproj",
+    "pyyaml",
+]
+
+[project.scripts]
+airblender = "airblender.cli:main"
+cams2wrf = "airblender.cli:main_cams2wrf"
+merra2wrf = "airblender.cli:main_merra2wrf"
+emac2wrf = "airblender.cli:main_emac2wrf"
+cams2wps = "airblender.cli:main_cams2wps"
+wrf2palm = "airblender.cli:main_wrf2palm"
+
+[tool.setuptools.packages.find]
+where = ["src"]

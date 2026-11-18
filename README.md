@@ -1,45 +1,170 @@
-# Merra2BC (`merra2wrf` & `cams2wrf`)
+# AirBlender
 
-Chemical and aerosol Initial & Boundary Condition (IC/BC) pre-processor for **WRF-Chem** (`wrfinput_d0*` and `wrfbdy_d01`), driven by NASA MERRA-2 reanalysis or ECMWF CAMS operational atmospheric composition & greenhouse gas forecasts.
+**Unified Atmospheric Meteorology, Chemistry, and Aerosol Coupler**
 
-## CAMS Workflow (`cams2wrf_main.py`)
+`AirBlender` (`airblender`) couples global atmospheric composition and reanalysis models (**ECMWF CAMS**, **NASA MERRA-2**, **EMAC / MESSy**) with regional **WPS / WRF-Chem** and urban microscale **PALM-4U** (`PIDS_DYNAMIC`), including gas-phase conversion, modal $\leftrightarrow$ sectional aerosol remapping, mixed-grid vertical pressure reconstruction, and direct Fortran unformatted WPS binary generation.
 
-### Required Donor Streams
-Placed under `--reanalysis_dir` using template `ECMWF-CAMS_{stream}_{date_time}.nc` (`YYYYMMDD`):
-* `sfc`: Surface pressure (`sp`) and single-level parameters (`0.4°`)
-* `ml`: 137 hybrid model-level meteorological, trace-gas, and aerosol fields (`0.4°`)
-* `ghg` *(optional, `--streams ghg` or automatic when present)*: High-resolution **`0.1°` 3D `co2` and `ch4`** from `cams-global-greenhouse-gas-forecasts` (`ECMWF-CAMS_ghg_{YYYYMMDD}.nc`, with automatic fallback to `ch4`/`ch4_c` in `ml` for methane)
+It is a standalone, `pip`-installable Python package.
 
-### Mixed-Grid (`0.1°` / `0.4°`) & Vertical Interpolation
-* `_derive_stream_p_rho` interpolates `sp` from `sfc` onto WRF interior or boundary coordinates and reconstructs 3D hybrid midpoint pressure $p_{\rho}(k) = a_k + b_k \cdot p_s$ using `GRIB_pv` coefficients on each stream grid.
-* Vertical interpolation to WRF eta pressure coordinates clamps pressure out-of-bounds cleanly to the top/bottom donor levels (`CO2` and `CH4` injected in `ppmv` for RACM/MADE-SORGAM/GOCART).
+---
 
-### Example Invocation
+## Key Capabilities & Coupling Pathways
+
+| Subcommand / Entry Point | Source $\rightarrow$ Target | Scope & Highlights |
+| :--- | :--- | :--- |
+| **`cams2wrf`** (`airblender.wrf_icbc`) | ECMWF CAMS $\rightarrow$ WRF-Chem | Reactive trace gases, `RACM_KPP_MADE_SORGAM_GOCART` aerosols, and mixed-grid `0.1°` CAMS GHG (`co2`, `ch4` with `ml` `ch4_c` fallback). Supports multiple nested `wrfinput_d0*` + `wrfbdy_d01` with edge-clamped vertical pressure interpolation and identical-step BC reuse. |
+| **`merra2wrf`** (`airblender.wrf_icbc`) | NASA MERRA-2 $\rightarrow$ WRF-Chem | `PL` + `DELP` fallback hybrid pressure reconstruction, `VVV` naming support, selectable WRF schemes (`made_sorgam`, `gocart`, `gocart_dust`, `mosaic_8bin`), full `CAMS2WRF` parity (stream caching + BC array reuse). |
+| **`emac2wrf`** (`airblender.wrf_icbc`) | EMAC / MESSy $\rightarrow$ WRF-Chem | Log-normal 4-mode (`ns, ks, as, cs`) $\rightarrow$ MADE/SORGAM 3-mode (`nu0/ai`, `ac0/aj`, `corn`) moment mapping, `[0, 360) -> [-180, 180)` longitude shifting, glob restart handling, and strict DSL syntax checking (including fixed `2.01*[SS_cs]` rule). |
+| **`cams2wps`** (`airblender.cams2wps`) | ECMWF CAMS $\rightarrow$ WPS | Direct Fortran unformatted WPS intermediate generator (`FILE:YYYY-MM-DD_HH`), computing 137-level midpoint pressures from `GRIB_pv` `(a_k, b_k)`, mapping `SOILHGT`, optional ECMWF OpenData 4-layer soil (`ST*`, `SM*`), atomic `.tmp` writes, and up-to-date slice skipping. |
+| **`wrf2palm`** (`airblender.palm_dynamic`) | WRF-Chem $\rightarrow$ PALM-4U | Generates `PIDS_DYNAMIC` (`_dynamic`) NetCDF-4 for urban microscale domains (`100 m` SLUrb / `10 m` LES) with `d02 -> d01` parent fallback, LCC projection + wind rotation, `PALM-meteo` (`universal`) barometric surface-layer pressure adaptation, and selectable `chemistry.palm_mode`: `meteorology` (`31` fields), `phstatp` (`55` fields), **`phstatp-salsa`** (`115` fields: conservative 7-species `['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH']` $\times$ 10-bin sectional WRF–SALSA remapping, `antha` excluded under `absolute_mass_number_v1`), and `legacy_3spec` (`97` fields). |
+
+---
+
+## Package Architecture
+
+```text
+AirBlender/
+├── pyproject.toml
+├── src/airblender/
+│   ├── cli.py                        # Unified `airblender` CLI & legacy entry points
+│   ├── wrf_icbc.py                   # Unified donor -> WRF-Chem IC/BC injector
+│   ├── cams2wps.py                   # CAMS NetCDF -> WPS intermediate binary converter
+│   ├── palm_dynamic.py               # WRF-Chem -> PALM-4U PIDS_DYNAMIC driver
+│   ├── sources/
+│   │   ├── base.py                   # DonorAdapter base class & stream/p_rho caching
+│   │   ├── cams.py                   # ECMWF CAMS (sfc, ml, ghg + valid_time/coord handling)
+│   │   ├── merra2.py                 # NASA MERRA-2 (PL + DELP fallback, VVV collections)
+│   │   └── emac.py                   # EMAC / MESSy (hybrid pressure, lon shift, glob files)
+│   ├── physics/
+│   │   ├── dsl.py                    # Strict mapping rule parser ("out <- a*[in];exp")
+│   │   ├── sectional_to_modal.py     # Log-normal modal number/mass factor computation
+│   │   ├── mappings.py               # CAMS, MERRA-2 (4 presets), and EMAC conversion tables
+│   │   └── salsa_remap.py            # Conservative 7-species x 10-bin WRF -> SALSA remapper
+│   ├── regrid/
+│   │   └── wrf_regrid.py             # Horizontal RegularGrid + log-P vertical & BC interpolation
+│   └── utils/
+│       ├── time_io.py                # Native datetime/char Times parsing & eta pressure derivation
+│       └── config_io.py              # YAML loader & ${VAR:-default} path expansion
+├── cams2wrf_main.py                  # Backwards-compatible CLI wrapper
+├── merra2wrf_main.py                 # Backwards-compatible CLI wrapper
+├── emac2wrf_main.py                  # Backwards-compatible CLI wrapper
+└── tests/
+    └── test_airblender.py            # Synthetic verification suite (DSL, IC/BC, WPS, PALM)
+```
+
+---
+
+## Installation
+
 ```bash
-python -u "${MERRA2BC_DIR}/cams2wrf_main.py" \
-    --start_date "${START_DATE}_00:00:00" \
-    --end_date "${END_DATE}_00:00:00" \
+pip install -e /path/to/AirBlender
+```
+
+Inside a pre-populated Conda/Mamba environment (skipping extra PyPI downloads):
+
+```bash
+pip install --no-deps --no-build-isolation -e /path/to/AirBlender
+```
+
+Dependencies: `numpy`, `scipy`, `xarray`, `netCDF4`, `pandas`, `pyproj`, `pyyaml`.
+
+---
+
+## CLI Usage
+
+### Unified `airblender` CLI
+
+```bash
+airblender --help
+
+# 1. CAMS -> WRF-Chem IC & BC (d01)
+airblender cams2wrf \
+    --start_date 2026-11-14_00:00:00 \
+    --end_date 2026-11-19_00:00:00 \
     --hourly_interval 3 \
     --do_IC --do_BC --zero_out_first \
-    --reanalysis_dir "${CAMS_DIR}/" \
+    --reanalysis_dir /path/to/CAMS \
     --reanalysis_file_name_template "ECMWF-CAMS_{stream}_{date_time}.nc" \
-    --wrf_dir "${WRF_RUN_DIR}" \
+    --wrf_dir /path/to/WRF/run \
     --wrf_input wrfinput_d01 \
     --wrf_bdy_file wrfbdy_d01 \
-    --wrf_met_dir "${MET_EM_DIR}" \
+    --wrf_met_dir /path/to/WPS \
     --wrf_met_files_name_template "met_em.d01.{}.nc" \
     --wrf_met_files_date_format "%Y-%m-%d_%H_%M_%S"
+
+# 2. MERRA-2 -> WRF-Chem IC & BC (selectable aerosol scheme)
+airblender merra2wrf --scheme mosaic_8bin ...   # presets: made_sorgam | gocart | gocart_dust | mosaic_8bin
+
+# 3. EMAC -> WRF-Chem IC & BC
+airblender emac2wrf ...
+
+# 4. CAMS -> WPS Intermediate Binaries (FILE:YYYY-MM-DD_HH)
+airblender cams2wps --sfc ECMWF-CAMS_sfc_20261114.nc --ml ECMWF-CAMS_ml_20261114.nc --outdir /path/to/WPS
+
+# 5. WRF-Chem -> PALM-4U Dynamic Driver (PIDS_DYNAMIC)
+airblender wrf2palm --config palm_doha_100m.yaml --date 2026-11-14 --mode phstatp-salsa
 ```
 
-## Required `namelist.input` Settings (`&chem`)
+Console scripts `cams2wrf`, `merra2wrf`, `emac2wrf`, `cams2wps`, and `wrf2palm`, as well as legacy repo-root entry scripts (`cams2wrf_main.py`, `merra2wrf_main.py`, `emac2wrf_main.py`), are also installed for backwards compatibility.
 
-```fortran
-&chem
- chem_in_opt                         = 1,
- have_bcs_chem                       = .true.,
- gas_ic_opt                          = 1,
- gas_bc_opt                          = 1,
- aer_ic_opt                          = 1,
- aer_bc_opt                          = 1,
-/
+---
+
+## Python Library API
+
+```python
+from airblender.wrf_icbc import run_wrf_icbc
+from airblender.cams2wps import convert_cams_to_wps
+from airblender.palm_dynamic import generate_palm_dynamic_driver
+
+run_wrf_icbc(
+    source="cams",
+    reanalysis_dir="/path/to/CAMS",
+    reanalysis_file_name_template="ECMWF-CAMS_{stream}_{date_time}.nc",
+    wrf_dir="/path/to/WRF/run",
+    wrf_met_dir="/path/to/WPS",
+    start_date="2026-11-14_00:00:00",
+    end_date="2026-11-15_00:00:00",
+    hourly_interval=3,
+    do_ic=True,
+    do_bc=True,
+    zero_out_first=True,
+    scheme="made_sorgam",
+)
+
+wps_files = convert_cams_to_wps(
+    cams_sfc_file="ECMWF-CAMS_sfc_20261114.nc",
+    cams_ml_file="ECMWF-CAMS_ml_20261114.nc",
+    output_dir="/path/to/WPS",
+)
+
+palm_summary = generate_palm_dynamic_driver(
+    config_or_path="palm_doha_100m.yaml",
+    date_str="2026-11-14",
+    palm_mode_override="phstatp-salsa",
+)
 ```
+
+---
+
+## Verification
+
+Run the synthetic verification suite (tests physics DSL, `SS_cs` bugfix, MADE moment factors, SALSA mass/number conservation, CAMS/MERRA-2/EMAC IC/BC injection, CAMS2WPS binary generation, and WRF2PALM `meteorology`/`phstatp`/`phstatp-salsa` drivers):
+
+```bash
+python tests/test_airblender.py
+```
+
+---
+
+## Renaming Notice (`Merra2BC` $\rightarrow$ `AirBlender`)
+
+This repository was renamed from **`Merra2BC`** to **`AirBlender`** (with default branch updated from `master` to `main`).
+
+* Downstream pipelines such as `operational-forecasting` now import `airblender` directly as a Python dependency instead of spawning subprocesses with `PYTHONPATH="${CLIMPY_DIR}:${MERRA2BC_DIR}"`.
+* Legacy wrapper scripts (`cams2wrf_main.py`, `merra2wrf_main.py`, `emac2wrf_main.py`) remain in the repository root for existing cron/Slurm workflows.
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
