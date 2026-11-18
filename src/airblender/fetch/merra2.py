@@ -20,6 +20,26 @@ MERRA2_COLLECTIONS: dict[str, str] = {
     "inst3_3d_chm_Nv": "https://goldsmr5.gesdisc.eosdis.nasa.gov/data/MERRA2/M2I3NVCHM.5.12.4",
 }
 
+MERRA2_EXTRA_COLLECTIONS: dict[str, str] = {
+    "tavg1_2d_aer_Nx": "https://goldsmr4.gesdisc.eosdis.nasa.gov/data/MERRA2/M2T1NXAER.5.12.4",
+    "tavgM_2d_aer_Nx": "https://goldsmr4.gesdisc.eosdis.nasa.gov/data/MERRA2_MONTHLY/M2TMNXAER.5.12.4",
+    "tavg3_3d_nav_Ne": "https://goldsmr5.gesdisc.eosdis.nasa.gov/data/MERRA2/M2T3NENAV.5.12.4",
+    "tavg1_2d_adg_Nx": "https://goldsmr4.gesdisc.eosdis.nasa.gov/data/MERRA2/M2T1NXADG.5.12.4",
+}
+
+ALL_MERRA2_COLLECTIONS: dict[str, str] = {**MERRA2_COLLECTIONS, **MERRA2_EXTRA_COLLECTIONS}
+
+MERRA2_PRESETS: dict[str, list[str]] = {
+    "wrfchem": list(MERRA2_COLLECTIONS.keys()),
+    "zittis_aot": [
+        "tavg1_2d_aer_Nx",
+        "tavgM_2d_aer_Nx",
+        "inst3_3d_aer_Nv",
+        "tavg3_3d_nav_Ne",
+        "tavg1_2d_adg_Nx",
+    ],
+}
+
 
 def merra2_stream_version(date_obj: dt.date | dt.datetime | pd.Timestamp | str) -> str:
     """Return NASA MERRA-2 file stream prefix (`100`..`401`) for a calendar date."""
@@ -42,15 +62,18 @@ def merra2_stream_version(date_obj: dt.date | dt.datetime | pd.Timestamp | str) 
 
 def build_merra2_url(collection: str, date_obj: dt.date | dt.datetime | pd.Timestamp | str) -> tuple[str, str]:
     """Return `(url, relative_target_path)` for one MERRA-2 collection and date."""
-    if collection not in MERRA2_COLLECTIONS:
-        raise KeyError(f"Unsupported MERRA-2 collection '{collection}'. Valid: {list(MERRA2_COLLECTIONS)}")
+    if collection not in ALL_MERRA2_COLLECTIONS:
+        raise KeyError(f"Unsupported MERRA-2 collection '{collection}'. Valid: {list(ALL_MERRA2_COLLECTIONS)}")
 
     ts = pd.Timestamp(date_obj)
     vvv = merra2_stream_version(ts)
-    mdate = ts.strftime("%Y%m%d")
-    filename = f"MERRA2_{vvv}.{collection}.{mdate}.nc4"
-    base_url = MERRA2_COLLECTIONS[collection].rstrip("/")
-    url = f"{base_url}/{ts.year:04d}/{ts.month:02d}/{filename}"
+    base_url = ALL_MERRA2_COLLECTIONS[collection].rstrip("/")
+    if collection.startswith("tavgM_"):
+        filename = f"MERRA2_{vvv}.{collection}.{ts.strftime('%Y%m')}.nc4"
+        url = f"{base_url}/{ts.year:04d}/{filename}"
+    else:
+        filename = f"MERRA2_{vvv}.{collection}.{ts.strftime('%Y%m%d')}.nc4"
+        url = f"{base_url}/{ts.year:04d}/{ts.month:02d}/{filename}"
     return url, f"{collection}/{filename}"
 
 
@@ -81,12 +104,13 @@ def download_merra2(
     ndays: int | None = None,
     out_dir: str | Path = ".",
     collections: Sequence[str] | None = None,
+    preset: str = "wrfchem",
     cookies_path: str | Path = "~/.urs_cookies",
     max_workers: int = 5,
     dry_run: bool = False,
     force: bool = False,
 ) -> list[Path]:
-    """Download MERRA-2 daily `.nc4` collections via `wget` + Earthdata session cookies."""
+    """Download MERRA-2 daily/monthly `.nc4` collections via `wget` + Earthdata session cookies."""
     start_ts = pd.Timestamp(start_date)
     if end_date is not None:
         end_ts = pd.Timestamp(end_date)
@@ -95,18 +119,29 @@ def download_merra2(
     else:
         end_ts = start_ts
 
-    active_collections = list(collections) if collections else list(MERRA2_COLLECTIONS.keys())
+    if collections:
+        active_collections = list(collections)
+    else:
+        if preset not in MERRA2_PRESETS:
+            raise KeyError(f"Unknown MERRA-2 preset '{preset}'. Valid: {list(MERRA2_PRESETS)}")
+        active_collections = MERRA2_PRESETS[preset]
+
     root = Path(out_dir)
     cookies = Path(cookies_path).expanduser()
 
     dates = pd.date_range(start=start_ts, end=end_ts, freq="D")
     planned: list[tuple[str, Path]] = []
     outputs: list[Path] = []
+    seen_targets: set[Path] = set()
 
     for col in active_collections:
         for ts in dates:
             url, rel_path = build_merra2_url(col, ts)
             target_fp = root / rel_path
+            if target_fp in seen_targets:
+                continue
+            seen_targets.add(target_fp)
+
             if dry_run:
                 print(f"[DRY-RUN] {url} -> {target_fp}")
                 outputs.append(target_fp)
@@ -140,10 +175,16 @@ def build_arg_parser(parser: argparse.ArgumentParser | None = None) -> argparse.
     parser.add_argument("--ndays", type=int, default=None, help="Number of days after start_date if end_date omitted")
     parser.add_argument("--outdir", default=".", help="Root MERRA-2 output directory (default: .)")
     parser.add_argument(
+        "--preset",
+        choices=list(MERRA2_PRESETS.keys()),
+        default="wrfchem",
+        help="Collection preset when --collections is omitted (default: wrfchem)",
+    )
+    parser.add_argument(
         "--collections",
         nargs="*",
         default=None,
-        help=f"Subset of collections (default: all {len(MERRA2_COLLECTIONS)})",
+        help=f"Explicit subset of collections ({', '.join(ALL_MERRA2_COLLECTIONS)})",
     )
     parser.add_argument("--cookies", default="~/.urs_cookies", help="Path to NASA Earthdata cookies file")
     parser.add_argument("--max_workers", type=int, default=5, help="Concurrent wget transfers (default: 5)")
@@ -161,6 +202,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ndays=args.ndays,
         out_dir=args.outdir,
         collections=args.collections,
+        preset=args.preset,
         cookies_path=args.cookies,
         max_workers=args.max_workers,
         dry_run=args.dry_run,

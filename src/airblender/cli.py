@@ -273,6 +273,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ndays=args.ndays,
             out_dir=args.outdir,
             collections=args.collections,
+            preset=args.preset,
             cookies_path=args.cookies,
             max_workers=args.max_workers,
             dry_run=args.dry_run,

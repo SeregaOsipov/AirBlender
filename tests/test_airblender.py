@@ -543,6 +543,11 @@ def test_fetch_subpackage() -> None:
         m2_paths = download_merra2("2026-11-14", out_dir=root / "m2", dry_run=True)
         assert len(m2_paths) == 7
         assert all(p.name.startswith("MERRA2_400.") and p.name.endswith(".20261114.nc4") for p in m2_paths)
+
+        m2_zittis = download_merra2("2026-11-14", "2026-11-15", out_dir=root / "m2z", preset="zittis_aot", dry_run=True)
+        # 4 daily collections x 2 days + 1 monthly collection deduplicated to 1 file = 9
+        assert len(m2_zittis) == 9
+        assert any(p.name == "MERRA2_400.tavgM_2d_aer_Nx.202611.nc4" for p in m2_zittis)
     print("  -> Test 4 PASSED.")
 
 

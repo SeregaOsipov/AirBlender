@@ -56,6 +56,7 @@ AirBlender/
 ├── cams2wrf_main.py                  # Backwards-compatible CLI wrapper
 ├── merra2wrf_main.py                 # Backwards-compatible CLI wrapper
 ├── emac2wrf_main.py                  # Backwards-compatible CLI wrapper
+├── scripts/merra2/                   # Legacy MERRA-2 wget shell scripts & README
 └── tests/
     └── test_airblender.py            # Synthetic verification suite (DSL, IC/BC, WPS, PALM)
 ```
