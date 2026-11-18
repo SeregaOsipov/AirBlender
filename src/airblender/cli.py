@@ -1,11 +1,13 @@
-"""Unified CLI entry points for AirBlender (`cams2wrf`, `merra2wrf`, `emac2wrf`, `cams2wps`, `wrf2palm`)."""
+"""Unified CLI entry points for AirBlender (`cams2wrf`, `merra2wrf`, `emac2wrf`, `cams2wps`, `wrf2palm`, `fetch-*`)."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from airblender.cams2wps import convert_cams_to_wps
+from airblender.fetch import cams_eac4, cams_forecast, ecmwf_ifs, era5_soil, merra2, opendata
 from airblender.palm_dynamic import PALM_MODES, generate_palm_dynamic_driver
 from airblender.utils.time_io import parse_wrf_datetime
 from airblender.wrf_icbc import run_wrf_icbc
@@ -122,7 +124,7 @@ def main_wrf2palm(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--wrf-dir", default=None, help="Optional directory containing wrfout_d02*/d01* files")
     parser.add_argument("--static-driver", default=None, help="Optional PALM _static driver override")
     parser.add_argument("--hours", type=float, default=None, help="Optional forecast duration override (hours)")
-    parser.add_argument("--palm-mode", choices=PALM_MODES, default=None, help="Override configured palm_mode")
+    parser.add_argument("--palm-mode", "--mode", dest="palm_mode", choices=PALM_MODES, default=None, help="Override configured palm_mode")
     args = parser.parse_args(argv)
     generate_palm_dynamic_driver(
         config_or_path=args.config,
@@ -139,7 +141,7 @@ def main_wrf2palm(argv: Sequence[str] | None = None) -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="airblender",
-        description="AirBlender — Unified atmospheric meteorology, chemistry, and aerosol coupler",
+        description="AirBlender — Unified atmospheric meteorology, chemistry, aerosol coupler & donor fetcher",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
     icbc_subcommands = {
@@ -167,7 +169,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     p_palm.add_argument("--wrf-dir", default=None)
     p_palm.add_argument("--static-driver", default=None)
     p_palm.add_argument("--hours", type=float, default=None)
-    p_palm.add_argument("--palm-mode", choices=PALM_MODES, default=None)
+    p_palm.add_argument("--palm-mode", "--mode", dest="palm_mode", choices=PALM_MODES, default=None)
+
+    cams_forecast.build_arg_parser(sub.add_parser("fetch-cams", help="Download ECMWF CAMS forecasts/analyses (GRIB pipelined)"))
+    cams_eac4.build_arg_parser(sub.add_parser("fetch-eac4", help="Download daily ECMWF CAMS EAC4 reanalysis"))
+    ecmwf_ifs.build_arg_parser(sub.add_parser("fetch-ifs", help="Download ECMWF MARS operational IFS NetCDFs"))
+    opendata.build_arg_parser(sub.add_parser("fetch-opendata", help="Download ECMWF OpenData HRES soil/surface GRIBs"))
+    era5_soil.build_arg_parser(sub.add_parser("fetch-era5-soil", help="Download ERA5 soil/surface NetCDFs"))
+    merra2.build_arg_parser(sub.add_parser("fetch-merra2", help="Download NASA MERRA-2 GES DISC collections"))
 
     args = parser.parse_args(argv)
     cmd = args.subcommand
@@ -211,4 +220,61 @@ def main(argv: Sequence[str] | None = None) -> None:
             palm_mode_override=args.palm_mode,
             wrf_dir_override=args.wrf_dir,
             static_driver_override=args.static_driver,
+        )
+    elif cmd == "fetch-cams":
+        cams_forecast.apply_config_and_defaults(args)
+        try:
+            cams_forecast.execute_cams_pipeline(args)
+        except (RuntimeError, ValueError) as exc:
+            cams_forecast.log_msg(f"Error: {exc}")
+            sys.exit(1)
+    elif cmd == "fetch-eac4":
+        cams_eac4.download_cams_eac4(
+            args.start_date,
+            args.end_date,
+            args.data_root_folder,
+            area=args.area,
+            force=args.force,
+        )
+    elif cmd == "fetch-ifs":
+        ecmwf_ifs.download_ecmwf_ifs(
+            args.start_date,
+            args.end_date,
+            args.data_root_folder,
+            grid=args.grid,
+            retrieve_ml=args.retrieve_ml,
+            force=args.force,
+        )
+    elif cmd == "fetch-opendata":
+        if args.mode in ("sol", "both"):
+            opendata.download_opendata_soil(
+                date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
+            )
+        if args.mode in ("sfc", "both"):
+            opendata.download_opendata_sfc(
+                date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
+            )
+    elif cmd == "fetch-era5-soil":
+        if not (args.date or args.start_date):
+            parser.error("fetch-era5-soil requires --date or --start_date.")
+        era5_soil.download_era5_soil(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            out_dir=args.outdir,
+            date=args.date,
+            time=args.time,
+            area=args.area,
+            force=args.force,
+        )
+    elif cmd == "fetch-merra2":
+        merra2.download_merra2(
+            args.start_date,
+            args.end_date,
+            ndays=args.ndays,
+            out_dir=args.outdir,
+            collections=args.collections,
+            cookies_path=args.cookies,
+            max_workers=args.max_workers,
+            dry_run=args.dry_run,
+            force=args.force,
         )

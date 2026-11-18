@@ -451,6 +451,101 @@ def test_cams2wps_and_wrf2palm() -> None:
     print("  -> Test 3 PASSED.")
 
 
+def test_fetch_subpackage() -> None:
+    print("[Test 4] Optional airblender.fetch chunking, CDM NetCDF contract, and MERRA-2 URLs...")
+    import argparse
+    import xarray as xr
+    from airblender.fetch.cams_forecast import (
+        apply_config_and_defaults,
+        generate_tasks,
+        save_dataset_daily_and_base,
+    )
+    from airblender.fetch.merra2 import download_merra2, merra2_stream_version
+    from airblender.sources.cams import CamsDonorAdapter, extract_cams_pv
+    from airblender.sources.base import DateDonorContext
+
+    with tempfile.TemporaryDirectory(prefix="airblender_fetch_") as td:
+        root = Path(td)
+        ns = argparse.Namespace(
+            mode=None,
+            start_date="2026-11-14",
+            end_date="2026-11-14",
+            data_root_folder=str(root / "cams_dl"),
+            config=None,
+            format="grib",
+            max_fields=10000,
+            sfc_lt_chunk=None,
+            met_lt_chunk=None,
+            chem_lt_chunk=None,
+            ghg_lt_chunk=24,
+            ghg=True,
+            ghg_only=False,
+            level_chunks=1,
+            max_workers=5,
+            max_retries=3,
+            list_tasks=True,
+            task_index=None,
+            sfc_only=False,
+            force=False,
+            type="forecast",
+            time="00:00",
+            area=None,
+            leadtimes=None,
+            no_split_days=False,
+        )
+        apply_config_and_defaults(ns)
+        tasks = generate_tasks(ns)
+        assert len(tasks) == 48, f"Expected 48 tasks (1 sfc + 4 met + 41 chem + 2 ghg), got {len(tasks)}"
+        assert all(t["num_fields"] <= 10000 for t in tasks), "Found task exceeding 10,000-field MARS limit"
+
+        # Verify producer -> consumer daily NetCDF contract with CamsDonorAdapter
+        times = np.array(["2026-11-14T00:00:00", "2026-11-15T00:00:00"], dtype="datetime64[ns]")
+        pv = np.array([2000.0, 50000.0, 0.0, 0.0, 0.4, 1.0], dtype=np.float32)
+        ds_syn = xr.Dataset(
+            data_vars={
+                "go3": (
+                    ("forecast_period", "model_level", "latitude", "longitude"),
+                    np.full((2, 2, 3, 3), 5.0e-8, dtype=np.float32),
+                    {"GRIB_pv": pv, "units": "kg kg-1"},
+                )
+            },
+            coords={
+                "forecast_period": [0, 24],
+                "valid_time": ("forecast_period", times),
+                "model_level": [1, 2],
+                "latitude": [26.0, 25.0, 24.0],
+                "longitude": [50.0, 51.0, 52.0],
+            },
+        )
+        cams_out = root / "cams_daily"
+        save_dataset_daily_and_base(ds_syn, "ml", "20261114", cams_out)
+        ml_14 = cams_out / "ECMWF-CAMS_ml_20261114.nc"
+        ml_15 = cams_out / "ECMWF-CAMS_ml_20261115.nc"
+        assert ml_14.exists() and ml_15.exists()
+
+        import pandas as pd
+        adapter = CamsDonorAdapter(cams_out, "ECMWF-CAMS_{stream}_{date_time}.nc")
+        for day_dt in (pd.Timestamp("2026-11-14T00:00:00"), pd.Timestamp("2026-11-15T00:00:00")):
+            ctx = DateDonorContext(date=day_dt)
+            ds_loaded = adapter.open_stream_for_date("ml", ctx)
+            assert ds_loaded is not None and "go3" in ds_loaded
+            assert float(ds_loaded.lat.values[0]) < float(ds_loaded.lat.values[-1])
+            assert len(extract_cams_pv(ds_loaded)) == 6
+            adapter.close_context(ctx)
+
+        # Verify MERRA-2 stream versions and dry-run paths
+        assert merra2_stream_version("2021-07-15") == "401"
+        assert merra2_stream_version("2023-06-01") == "400"
+        assert merra2_stream_version("2005-01-01") == "300"
+        assert merra2_stream_version("1995-01-01") == "200"
+        assert merra2_stream_version("1985-01-01") == "100"
+
+        m2_paths = download_merra2("2026-11-14", out_dir=root / "m2", dry_run=True)
+        assert len(m2_paths) == 7
+        assert all(p.name.startswith("MERRA2_400.") and p.name.endswith(".20261114.nc4") for p in m2_paths)
+    print("  -> Test 4 PASSED.")
+
+
 def main() -> None:
     print("=" * 68)
     print(" Running AirBlender Verification Suite")
@@ -458,6 +553,7 @@ def main() -> None:
     test_physics_and_regrid_fixes()
     test_unified_cams_merra2_emac_icbc()
     test_cams2wps_and_wrf2palm()
+    test_fetch_subpackage()
     print("=" * 68)
     print(" ALL AIRBLENDER CHECKS PASSED (100% OK)")
     print("=" * 68)

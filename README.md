@@ -17,6 +17,7 @@ It is a standalone, `pip`-installable Python package.
 | **`emac2wrf`** (`airblender.wrf_icbc`) | EMAC / MESSy $\rightarrow$ WRF-Chem | Log-normal 4-mode (`ns, ks, as, cs`) $\rightarrow$ MADE/SORGAM 3-mode (`nu0/ai`, `ac0/aj`, `corn`) moment mapping, `[0, 360) -> [-180, 180)` longitude shifting, glob restart handling, and strict DSL syntax checking (including fixed `2.01*[SS_cs]` rule). |
 | **`cams2wps`** (`airblender.cams2wps`) | ECMWF CAMS $\rightarrow$ WPS | Direct Fortran unformatted WPS intermediate generator (`FILE:YYYY-MM-DD_HH`), computing 137-level midpoint pressures from `GRIB_pv` `(a_k, b_k)`, mapping `SOILHGT`, optional ECMWF OpenData 4-layer soil (`ST*`, `SM*`), atomic `.tmp` writes, and up-to-date slice skipping. |
 | **`wrf2palm`** (`airblender.palm_dynamic`) | WRF-Chem $\rightarrow$ PALM-4U | Generates `PIDS_DYNAMIC` (`_dynamic`) NetCDF-4 for urban microscale domains (`100 m` SLUrb / `10 m` LES) with `d02 -> d01` parent fallback, LCC projection + wind rotation, `PALM-meteo` (`universal`) barometric surface-layer pressure adaptation, and selectable `chemistry.palm_mode`: `meteorology` (`31` fields), `phstatp` (`55` fields), **`phstatp-salsa`** (`115` fields: conservative 7-species `['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH']` $\times$ 10-bin sectional WRF–SALSA remapping, `antha` excluded under `absolute_mass_number_v1`), and `legacy_3spec` (`97` fields). |
+| **`fetch-*`** (`airblender.fetch`) *(optional `[fetch]`)* | ADS / CDS / MARS / OpenData / GES DISC $\rightarrow$ Local NetCDF/GRIB | Donor forcing acquisition: **`fetch-cams`** (137-level CAMS GRIB pipelining + CDM `ECMWF-CAMS_{sfc,ml,ghg}_YYYYMMDD.nc`), **`fetch-eac4`** (EAC4 reanalysis), **`fetch-ifs`** (MARS IFS `F1280`), **`fetch-opendata`** (ECMWF HRES 4-layer soil `vsw`/`sot` & `sfc`), **`fetch-era5-soil`** (ERA5 soil NetCDFs), and **`fetch-merra2`** (concurrent NASA GES DISC `.nc4` collections). |
 
 ---
 
@@ -30,6 +31,13 @@ AirBlender/
 │   ├── wrf_icbc.py                   # Unified donor -> WRF-Chem IC/BC injector
 │   ├── cams2wps.py                   # CAMS NetCDF -> WPS intermediate binary converter
 │   ├── palm_dynamic.py               # WRF-Chem -> PALM-4U PIDS_DYNAMIC driver
+│   ├── fetch/                        # Optional donor data fetchers (pip install airblender[fetch])
+│   │   ├── cams_forecast.py          # ECMWF CAMS forecast/analysis GRIB pipelining & daily NetCDFs
+│   │   ├── cams_eac4.py              # ECMWF CAMS EAC4 60-level daily reanalysis
+│   │   ├── ecmwf_ifs.py              # ECMWF MARS operational IFS F1280 downloader
+│   │   ├── opendata.py               # ECMWF OpenData HRES soil (sol) & surface (sfc) GRIBs
+│   │   ├── era5_soil.py              # ECMWF ERA5 land/soil NetCDF downloader
+│   │   └── merra2.py                 # NASA MERRA-2 GES DISC wget downloader
 │   ├── sources/
 │   │   ├── base.py                   # DonorAdapter base class & stream/p_rho caching
 │   │   ├── cams.py                   # ECMWF CAMS (sfc, ml, ghg + valid_time/coord handling)
@@ -58,6 +66,8 @@ AirBlender/
 
 ```bash
 pip install -e /path/to/AirBlender
+# With optional donor downloaders (cdsapi, cfgrib, eccodes, ecmwf-opendata, ecmwf-api-client):
+pip install -e "/path/to/AirBlender[fetch]"
 ```
 
 Inside a pre-populated Conda/Mamba environment (skipping extra PyPI downloads):
@@ -66,7 +76,8 @@ Inside a pre-populated Conda/Mamba environment (skipping extra PyPI downloads):
 pip install --no-deps --no-build-isolation -e /path/to/AirBlender
 ```
 
-Dependencies: `numpy`, `scipy`, `xarray`, `netCDF4`, `pandas`, `pyproj`, `pyyaml`.
+Core dependencies: `numpy`, `scipy`, `xarray`, `netCDF4`, `pandas`, `pyproj`, `pyyaml`.  
+Optional `[fetch]` dependencies (`cdsapi`, `cfgrib`, `eccodes`, `ecmwf-opendata`, `ecmwf-api-client`) are lazy-imported so offline compute nodes do not require them.
 
 ---
 
@@ -103,6 +114,14 @@ airblender cams2wps --sfc ECMWF-CAMS_sfc_20261114.nc --ml ECMWF-CAMS_ml_20261114
 
 # 5. WRF-Chem -> PALM-4U Dynamic Driver (PIDS_DYNAMIC)
 airblender wrf2palm --config palm_doha_100m.yaml --date 2026-11-14 --mode phstatp-salsa
+
+# 6. Optional Donor Data Acquisition (`airblender[fetch]`)
+airblender fetch-cams --start_date 2026-11-14 --end_date 2026-11-14 --data_root_folder /path/to/CAMS --type forecast --time 00:00 --ghg
+airblender fetch-eac4 --start_date 2026-03-01 --end_date 2026-03-05 --data_root_folder /path/to/EAC4
+airblender fetch-ifs --start_date 2026-03-01 --end_date 2026-03-02 --data_root_folder /path/to/IFS --grid F1280 --retrieve_ml true
+airblender fetch-opendata --mode sol --date 2026-11-14 --outdir /path/to/HRES
+airblender fetch-era5-soil --date 2026-03-01 --outdir /path/to/ERA5
+airblender fetch-merra2 --start_date 2026-11-14 --ndays 2 --outdir /path/to/MERRA2
 ```
 
 Console scripts `cams2wrf`, `merra2wrf`, `emac2wrf`, `cams2wps`, and `wrf2palm`, as well as legacy repo-root entry scripts (`cams2wrf_main.py`, `merra2wrf_main.py`, `emac2wrf_main.py`), are also installed for backwards compatibility.
@@ -115,6 +134,17 @@ Console scripts `cams2wrf`, `merra2wrf`, `emac2wrf`, `cams2wps`, and `wrf2palm`,
 from airblender.wrf_icbc import run_wrf_icbc
 from airblender.cams2wps import convert_cams_to_wps
 from airblender.palm_dynamic import generate_palm_dynamic_driver
+from airblender.fetch import download_cams_forecast, download_opendata_soil
+
+download_cams_forecast(
+    start_date="2026-11-14",
+    end_date="2026-11-14",
+    data_root_folder="/path/to/CAMS",
+    cams_type="forecast",
+    cams_time="00:00",
+    ghg=True,
+)
+download_opendata_soil(date="2026-11-14", out_dir="/path/to/HRES")
 
 run_wrf_icbc(
     source="cams",

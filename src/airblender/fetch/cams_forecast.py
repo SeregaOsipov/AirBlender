@@ -1,0 +1,1305 @@
+"""
+ECMWF CAMS Global Atmospheric Composition, Meteorology & GHG Forecasts Downloader
+--------------------------------------------------------------------------------
+Ported from ``download_ECMWF_CAMS_AC_Forecast_to_drive_ICON.py`` with lazy
+optional imports (`cdsapi`, `cfgrib`) so offline compute nodes do not require them.
+
+Architectural features:
+1. Native GRIB retrieval (``data_format='grib'``) converted locally to CDM NetCDF
+   via streaming ``cfgrib`` (``read_keys=['pv']``), preserving ``GRIB_pv`` and
+   standardizing dimensions ``(forecast_period, forecast_reference_time, [model_level,] latitude, longitude)``.
+2. Dense request packing under the 10,000-field MARS limit.
+3. Concurrent ADS queue pipelining via ``ThreadPoolExecutor`` + atomic daily slicing
+   into ``ECMWF-CAMS_{sfc,ml,ghg}_{YYYYMMDD}.nc``.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import math
+import os
+from pathlib import Path
+import shutil
+import sys
+import threading
+import time
+from typing import Any, Sequence
+import zipfile
+
+import netCDF4
+import numpy as np
+import pandas as pd
+import xarray as xr
+import yaml
+
+
+_PRINT_LOCK = threading.Lock()
+_NETCDF_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
+
+SURFACE_VARS = [
+    "surface_pressure",
+    "mean_sea_level_pressure",
+    "surface_geopotential",
+    "2m_temperature",
+    "2m_dewpoint_temperature",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
+    "sea_surface_temperature",
+    "sea_ice_cover",
+    "skin_temperature",
+    "snow_depth",
+    "snow_density",
+    "snow_albedo",
+    "temperature_of_snow_layer",
+    "volumetric_soil_water_layer_1",
+    "volumetric_soil_water_layer_2",
+    "volumetric_soil_water_layer_3",
+    "volumetric_soil_water_layer_4",
+    "soil_temperature_level_1",
+    "soil_temperature_level_2",
+    "soil_temperature_level_3",
+    "soil_temperature_level_4",
+    "land_sea_mask",
+    "skin_reservoir_content",
+]
+
+UPPER_AIR_VARS = [
+    "u_component_of_wind",
+    "v_component_of_wind",
+    "vertical_velocity",
+    "specific_cloud_liquid_water_content",
+    "specific_cloud_ice_water_content",
+    "geopotential",
+]
+
+CHEM_VARS = [
+    "carbon_monoxide",
+    "dust_aerosol_0.03-0.55um_mixing_ratio",
+    "dust_aerosol_0.55-0.9um_mixing_ratio",
+    "dust_aerosol_0.9-20um_mixing_ratio",
+    "ethane",
+    "formaldehyde",
+    "hydrogen_peroxide",
+    "hydrophilic_black_carbon_aerosol_mixing_ratio",
+    "hydrophilic_organic_matter_aerosol_mixing_ratio",
+    "hydrophobic_black_carbon_aerosol_mixing_ratio",
+    "hydrophobic_organic_matter_aerosol_mixing_ratio",
+    "hydroxyl_radical",
+    "isoprene",
+    "nitric_acid",
+    "nitrogen_dioxide",
+    "nitrogen_monoxide",
+    "ozone",
+    "peroxyacetyl_nitrate",
+    "propane",
+    "sea_salt_aerosol_0.03-0.55um_mixing_ratio",
+    "sea_salt_aerosol_0.5-5um_mixing_ratio",
+    "sea_salt_aerosol_5-20um_mixing_ratio",
+    "specific_humidity",
+    "sulphate_aerosol_mixing_ratio",
+    "sulphur_dioxide",
+    "temperature",
+    "acetone",
+    "acetone_product",
+    "aldehydes",
+    "amine",
+    "ammonia",
+    "ammonium",
+    "dimethyl_sulfide",
+    "dinitrogen_pentoxide",
+    "ethanol",
+    "ethene",
+    "formic_acid",
+    "hydroperoxy_radical",
+    "lead",
+    "methacrolein_mvk",
+    "methacrylic_acid",
+    "methane",
+    "methane_sulfonic_acid",
+    "methanol",
+    "methyl_glyoxal",
+    "methyl_peroxide",
+    "methylperoxy_radical",
+    "nitrate",
+    "nitrate_radical",
+    "olefins",
+    "organic_ethers",
+    "organic_nitrates",
+    "paraffins",
+    "pernitric_acid",
+    "peroxides",
+    "peroxy_acetyl_radical",
+    "propene",
+    "radon",
+    "stratospheric_ozone_tracer",
+    "terpenes",
+]
+
+GHG_VARS = ["carbon_dioxide", "methane"]
+
+
+def log_msg(msg: str) -> None:
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _PRINT_LOCK:
+        print(f"[{ts}] {msg}", flush=True)
+
+
+def get_thread_cds_client():
+    import cdsapi
+
+    if not hasattr(_THREAD_LOCAL, "client") or _THREAD_LOCAL.client is None:
+        _THREAD_LOCAL.client = cdsapi.Client()
+    return _THREAD_LOCAL.client
+
+
+def reset_thread_cds_client():
+    import cdsapi
+
+    _THREAD_LOCAL.client = cdsapi.Client()
+    return _THREAD_LOCAL.client
+
+
+def build_arg_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
+    if parser is None:
+        parser = argparse.ArgumentParser(
+            prog="airblender fetch-cams",
+            description="Download ECMWF CAMS Atmospheric Composition Forecasts/Analyses with GRIB pipelining.",
+        )
+    parser.add_argument("--mode", "--port", "--host", help="Ignored PyCharm debugger flags")
+    parser.add_argument("--start_date", help="Start base date (YYYY-MM-DD)", required=True)
+    parser.add_argument("--end_date", help="End base date (YYYY-MM-DD)", required=True)
+    parser.add_argument("--data_root_folder", required=True, help="Target output directory for merged NetCDFs")
+    parser.add_argument("--config", default=None, help="Optional YAML configuration file path")
+    parser.add_argument(
+        "--format",
+        choices=["grib", "netcdf_zip"],
+        default=None,
+        help="Native ADS retrieval format (default: grib)",
+    )
+    parser.add_argument(
+        "--max_fields",
+        type=int,
+        default=None,
+        help="MARS request cost limit in fields (default: 10000)",
+    )
+    parser.add_argument("--sfc_lt_chunk", type=int, default=None, help="Max lead times per 2D Surface request")
+    parser.add_argument("--met_lt_chunk", type=int, default=None, help="Max lead times per 3D Met request")
+    parser.add_argument("--chem_lt_chunk", type=int, default=None, help="Max lead times per 3D Chem request")
+    parser.add_argument("--ghg_lt_chunk", type=int, default=None, help="Max lead times per 3D GHG request")
+    parser.add_argument(
+        "--ghg",
+        dest="ghg",
+        action="store_true",
+        default=None,
+        help="Also download 3D CO2 & CH4 from cams-global-greenhouse-gas-forecasts (0.1 deg)",
+    )
+    parser.add_argument(
+        "--no_ghg",
+        dest="ghg",
+        action="store_false",
+        help="Disable GHG stream even if enabled in config",
+    )
+    parser.add_argument(
+        "--ghg_only",
+        action="store_true",
+        help="Download/merge only 3D GHG fields (ECMWF-CAMS_ghg_YYYYMMDD.nc)",
+    )
+    parser.add_argument(
+        "--level_chunks",
+        type=int,
+        default=None,
+        help="Number of vertical chunks to split the 137 model levels into (default: 1)",
+    )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=None,
+        help="Number of concurrent ThreadPoolExecutor workers for ADS queue pipelining (default: 5)",
+    )
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=None,
+        help="Max retries with exponential backoff per task for transient errors (default: 3)",
+    )
+    parser.add_argument("--list_tasks", action="store_true", help="Print chunking table and total tasks, then exit")
+    parser.add_argument(
+        "--task_index",
+        type=int,
+        default=None,
+        help="Execute a single task index (0 to N-1) for Slurm array execution",
+    )
+    parser.add_argument("--sfc_only", action="store_true", help="Download/update only 2D surface fields")
+    parser.add_argument("--force", action="store_true", help="Force re-download even if files or markers exist")
+    parser.add_argument(
+        "--type",
+        choices=["analysis", "forecast"],
+        default=None,
+        help="Dataset type: 'analysis' or 'forecast' (default: analysis)",
+    )
+    parser.add_argument(
+        "--time",
+        default=None,
+        help="Base initialization time, e.g. '00:00' or '12:00' (default: 00:00)",
+    )
+    parser.add_argument(
+        "--area",
+        nargs=4,
+        type=float,
+        default=None,
+        metavar=("NORTH", "WEST", "SOUTH", "EAST"),
+        help="Geographic bounding box [North, West, South, East] in degrees (default: global)",
+    )
+    parser.add_argument(
+        "--leadtimes",
+        nargs="*",
+        default=None,
+        help="Lead times in hours (e.g. 0 3 6 ... 120). For 'forecast', defaults to 0..120 step 3.",
+    )
+    parser.add_argument(
+        "--no_split_days",
+        action="store_true",
+        help="Do not split multi-day forecasts into daily files",
+    )
+    return parser
+
+
+def apply_config_and_defaults(args: argparse.Namespace) -> None:
+    args.data_root_folder = str(args.data_root_folder)
+    cfg_data: dict[str, Any] = {}
+    if args.config and os.path.exists(str(args.config)):
+        with open(str(args.config), "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        cfg_data = raw_cfg.get("data", raw_cfg)
+
+    def pick(cli_val, cfg_key, default_val):
+        if cli_val is not None:
+            return cli_val
+        if cfg_key in cfg_data and cfg_data[cfg_key] is not None:
+            return cfg_data[cfg_key]
+        return default_val
+
+    args.type = pick(args.type, "cams_type", "analysis")
+    args.time = pick(args.time, "cams_time", "00:00")
+    args.format = pick(args.format, "cams_format", "grib")
+    args.max_fields = int(pick(args.max_fields, "cams_max_fields", 10000))
+    args.sfc_lt_chunk = pick(args.sfc_lt_chunk, "cams_sfc_lt_chunk", None)
+    args.met_lt_chunk = pick(args.met_lt_chunk, "cams_met_lt_chunk", None)
+    args.chem_lt_chunk = pick(args.chem_lt_chunk, "cams_chem_lt_chunk", None)
+    args.ghg_lt_chunk = pick(args.ghg_lt_chunk, "cams_ghg_lt_chunk", None)
+    args.ghg = bool(pick(args.ghg, "cams_ghg", False))
+    args.level_chunks = int(pick(args.level_chunks, "cams_level_chunks", 1))
+    args.max_workers = int(pick(args.max_workers, "cams_max_workers", 5))
+    args.max_retries = int(pick(args.max_retries, "cams_max_retries", 3))
+    if args.leadtimes is None and "cams_leadtimes" in cfg_data and cfg_data["cams_leadtimes"] is not None:
+        lt_cfg = cfg_data["cams_leadtimes"]
+        args.leadtimes = [str(x) for x in lt_cfg] if isinstance(lt_cfg, list) else [str(lt_cfg)]
+    if args.area is None:
+        raw_area = cfg_data.get("cams_area") or cfg_data.get("area")
+        if raw_area is not None and isinstance(raw_area, (list, tuple)) and len(raw_area) == 4:
+            args.area = [float(x) for x in raw_area]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    args = build_arg_parser().parse_args(argv)
+    apply_config_and_defaults(args)
+    return args
+
+
+def resolve_time_and_leadtimes(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    if isinstance(args.time, list):
+        times = [str(t).strip() for t in args.time if str(t).strip()]
+    elif "," in str(args.time):
+        times = [t.strip() for t in str(args.time).split(",") if t.strip()]
+    else:
+        times = [str(args.time).strip()]
+
+    if args.type == "analysis":
+        leadtimes = ["0"]
+    else:
+        if args.leadtimes is not None:
+            raw_leadtimes = []
+            for item in args.leadtimes:
+                for part in str(item).split(","):
+                    part = part.strip()
+                    if part:
+                        raw_leadtimes.append(part)
+            leadtimes = raw_leadtimes if raw_leadtimes else [str(h) for h in range(0, 121, 3)]
+        else:
+            leadtimes = [str(h) for h in range(0, 121, 3)]
+
+    return times, leadtimes
+
+
+def compute_stream_chunking(
+    num_vars: int,
+    levels_list: list[str] | None,
+    num_times: int,
+    leadtimes: list[str],
+    max_fields: int = 10000,
+    explicit_lt_chunk: int | None = None,
+    explicit_level_chunks: int = 1,
+):
+    """
+    Compute `(level_chunks, lt_chunks, fields_per_lt, max_lt_per_req)` so each request satisfies:
+        num_vars * len(level_chunk) * len(lt_chunk) * num_times <= max_fields
+    """
+    total_levels = len(levels_list) if levels_list else 1
+    num_lvl_chunks = max(1, int(explicit_level_chunks or 1))
+
+    while True:
+        lvl_chunk_size = math.ceil(total_levels / num_lvl_chunks)
+        fields_per_lt = num_vars * lvl_chunk_size * num_times
+        if fields_per_lt <= max_fields or lvl_chunk_size == 1:
+            break
+        num_lvl_chunks += 1
+
+    if levels_list:
+        lvl_chunk_size = math.ceil(total_levels / num_lvl_chunks)
+        level_chunks = [levels_list[i : i + lvl_chunk_size] for i in range(0, total_levels, lvl_chunk_size)]
+    else:
+        level_chunks = [None]
+
+    max_lt_per_req = max(1, max_fields // fields_per_lt)
+    if explicit_lt_chunk is not None and int(explicit_lt_chunk) > 0:
+        lt_chunk_size = min(int(explicit_lt_chunk), max_lt_per_req)
+    else:
+        lt_chunk_size = min(len(leadtimes), max_lt_per_req)
+
+    lt_chunks = [leadtimes[i : i + lt_chunk_size] for i in range(0, len(leadtimes), lt_chunk_size)]
+    return level_chunks, lt_chunks, fields_per_lt, max_lt_per_req
+
+
+def _standardize_cfgrib_ds(ds: xr.Dataset, is_3d: bool = False) -> xr.Dataset:
+    for dim in list(ds.dims):
+        if dim not in ("time", "step", "hybrid", "latitude", "longitude"):
+            if ds.sizes[dim] == 1:
+                ds = ds.squeeze(dim, drop=True)
+    for coord in list(ds.coords):
+        if coord not in ("time", "step", "hybrid", "latitude", "longitude", "valid_time"):
+            ds = ds.drop_vars(coord, errors="ignore")
+
+    rename_map = {}
+    if "step" in ds.dims or "step" in ds.coords:
+        rename_map["step"] = "forecast_period"
+    if "time" in ds.dims or "time" in ds.coords:
+        rename_map["time"] = "forecast_reference_time"
+    if is_3d and ("hybrid" in ds.dims or "hybrid" in ds.coords):
+        rename_map["hybrid"] = "model_level"
+    if rename_map:
+        ds = ds.rename(rename_map)
+
+    if "forecast_period" in ds.dims and ds.sizes["forecast_period"] > 1:
+        ds = ds.sortby("forecast_period")
+    if is_3d and "model_level" in ds.dims and ds.sizes["model_level"] > 1:
+        ds = ds.sortby("model_level")
+    return ds
+
+
+def convert_grib_to_cdm_nc(grib_path: str, nc_path: str, is_3d: bool = False) -> None:
+    """
+    Streaming, memory-bounded (< 300 MB RAM) converter from CAMS GRIB to CDM NetCDF:
+      - Reuses a single on-disk GRIB index (.idx) across all paramIds.
+      - Streams one variable (paramId) and one forecast_period slice at a time.
+      - Preserves GRIB_pv hybrid vertical coordinate coefficients on 3D variables.
+    """
+    import cfgrib
+    import cfgrib.cfmessage
+    import cfgrib.dataset
+    import cfgrib.messages
+    import cfgrib.xarray_store
+
+    with _NETCDF_LOCK:
+        idx_path = f"{grib_path}.{os.getpid()}.idx"
+        tmp_nc = f"{nc_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        for stale in (idx_path, tmp_nc):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+
+        try:
+            stream = cfgrib.messages.FileStream(grib_path, errors="ignore")
+            index = cfgrib.dataset.open_fileindex(
+                stream, computed_keys=cfgrib.cfmessage.COMPUTED_KEYS, indexpath=idx_path
+            )
+            param_ids = sorted(index["paramId"])
+            if not param_ids:
+                raise RuntimeError(f"cfgrib found 0 paramIds in {grib_path}")
+            lvl_vals = index.get("level:float", index.get("level", []))
+            has_multi_levels = len(lvl_vals) > 1
+
+            base_bks: dict[str, Any] = {"indexpath": idx_path, "squeeze": False, "errors": "ignore"}
+            if is_3d:
+                base_bks["read_keys"] = ["pv"]
+
+            header_written = False
+            nc_out = None
+
+            try:
+                for param_id in param_ids:
+                    bk = base_bks.copy()
+                    bk["filter_by_keys"] = {"paramId": param_id}
+                    sub_datasets = cfgrib.xarray_store.raw_open_datasets(grib_path, bk)
+
+                    for raw_ds in sub_datasets:
+                        try:
+                            ds = _standardize_cfgrib_ds(raw_ds, is_3d=is_3d)
+                            if is_3d and has_multi_levels and ds.sizes.get("model_level", 0) <= 1:
+                                continue
+                            target_order = ["forecast_period", "forecast_reference_time"]
+                            if is_3d and "model_level" in ds.dims:
+                                target_order.append("model_level")
+                            for d in ds.dims:
+                                if d not in target_order:
+                                    target_order.append(d)
+                            target_dims = tuple(d for d in target_order if d in ds.dims)
+
+                            if not header_written:
+                                ds_coords = xr.Dataset(coords=ds.coords, attrs=ds.attrs)
+                                ds_coords.to_netcdf(tmp_nc, mode="w")
+                                ds_coords.close()
+                                nc_out = netCDF4.Dataset(tmp_nc, mode="a")
+                                header_written = True
+
+                            for var_name, da in ds.data_vars.items():
+                                if var_name in nc_out.variables:
+                                    continue
+
+                                nc_var = nc_out.createVariable(
+                                    var_name, "f4", target_dims, fill_value=np.float32(np.nan)
+                                )
+                                for attr_k, attr_v in da.attrs.items():
+                                    if attr_k in ("_FillValue", "missing_value"):
+                                        continue
+                                    nc_var.setncattr(attr_k, attr_v)
+                                if "valid_time" in ds.coords:
+                                    nc_var.setncattr("coordinates", "valid_time")
+
+                                if "forecast_period" in target_dims:
+                                    sub_dims = tuple(d for d in target_dims if d != "forecast_period")
+                                    n_fp = ds.sizes["forecast_period"]
+                                    for t_idx in range(n_fp):
+                                        da_slice = da.isel(forecast_period=t_idx).transpose(*sub_dims)
+                                        nc_var[t_idx, ...] = np.asarray(da_slice.values, dtype=np.float32)
+                                else:
+                                    da_T = da.transpose(*target_dims)
+                                    nc_var[...] = np.asarray(da_T.values, dtype=np.float32)
+                        finally:
+                            try:
+                                raw_ds.close()
+                            except Exception:
+                                pass
+            finally:
+                if nc_out is not None:
+                    nc_out.close()
+
+            if not header_written:
+                raise RuntimeError(f"cfgrib decoded 0 variable datasets from {grib_path}")
+
+            os.replace(tmp_nc, nc_path)
+        finally:
+            for cleanup_fp in (idx_path, tmp_nc):
+                if os.path.exists(cleanup_fp):
+                    try:
+                        os.remove(cleanup_fp)
+                    except OSError:
+                        pass
+
+
+def extract_nc_from_zip_to_target(zip_path: str, target_nc_path: str, extract_subdir: str) -> None:
+    os.makedirs(extract_subdir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(extract_subdir)
+    nc_files = [os.path.join(extract_subdir, f) for f in os.listdir(extract_subdir) if f.endswith(".nc")]
+    if not nc_files:
+        raise RuntimeError(f"No .nc files found in {zip_path}")
+    if len(nc_files) == 1:
+        shutil.move(nc_files[0], target_nc_path)
+    else:
+        with _NETCDF_LOCK:
+            ds_list = [xr.open_dataset(f) for f in nc_files]
+            merged = xr.merge(ds_list, compat="override")
+            tmp_nc = f"{target_nc_path}.tmp"
+            merged.to_netcdf(tmp_nc)
+            for ds in ds_list:
+                ds.close()
+            merged.close()
+            os.replace(tmp_nc, target_nc_path)
+    shutil.rmtree(extract_subdir, ignore_errors=True)
+
+
+def _write_ds_streaming(ds_out: xr.Dataset, target_fp: str) -> None:
+    """
+    Stream an xarray Dataset to NetCDF one variable and one `forecast_period`
+    slice at a time (< 250 MB peak RAM).
+    """
+    tmp_fp = f"{target_fp}.tmp.{os.getpid()}"
+    if os.path.exists(tmp_fp):
+        try:
+            os.remove(tmp_fp)
+        except OSError:
+            pass
+    try:
+        ds_coords = xr.Dataset(coords=ds_out.coords, attrs=ds_out.attrs).compute()
+        ds_coords.to_netcdf(tmp_fp, mode="w")
+        ds_coords.close()
+
+        nc_out = netCDF4.Dataset(tmp_fp, mode="a")
+        try:
+            for var_name, da in ds_out.data_vars.items():
+                if var_name in nc_out.variables:
+                    continue
+                dims = da.dims
+                nc_var = nc_out.createVariable(var_name, "f4", dims, fill_value=np.float32(np.nan))
+                for attr_k, attr_v in da.attrs.items():
+                    if attr_k in ("_FillValue", "missing_value"):
+                        continue
+                    nc_var.setncattr(attr_k, attr_v)
+                if "valid_time" in ds_out.coords and "coordinates" not in da.attrs:
+                    nc_var.setncattr("coordinates", "valid_time")
+
+                if "forecast_period" in dims and dims[0] == "forecast_period":
+                    n_fp = da.sizes["forecast_period"]
+                    for t_idx in range(n_fp):
+                        nc_var[t_idx, ...] = np.asarray(da.isel(forecast_period=t_idx).values, dtype=np.float32)
+                else:
+                    nc_var[...] = np.asarray(da.values, dtype=np.float32)
+        finally:
+            nc_out.close()
+
+        os.replace(tmp_fp, target_fp)
+    finally:
+        if os.path.exists(tmp_fp):
+            try:
+                os.remove(tmp_fp)
+            except OSError:
+                pass
+
+
+def save_dataset_daily_and_base(
+    ds: xr.Dataset, stream: str, date_str: str, data_root_folder: str | Path, no_split_days: bool = False
+) -> None:
+    """
+    Save `ds` into `data_root_folder` as `ECMWF-CAMS_{stream}_{YYYYMMDD}.nc` daily slices
+    (plus base `ECMWF-CAMS_{stream}_{date_str}.nc` if not yet written).
+    """
+    root = str(data_root_folder)
+    os.makedirs(root, exist_ok=True)
+    valid_times = None
+    if "valid_time" in ds.coords:
+        vt = np.asarray(ds.valid_time.values)
+        valid_times = pd.to_datetime(vt.flatten() if vt.ndim > 1 else vt)
+    elif "time" in ds.coords:
+        valid_times = pd.to_datetime(np.asarray(ds.time.values))
+
+    if valid_times is not None:
+        unique_days = sorted(list(set(valid_times.strftime("%Y%m%d"))))
+    else:
+        unique_days = [date_str]
+
+    if no_split_days or len(unique_days) <= 1:
+        out_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
+        _write_ds_streaming(ds, out_fp)
+        log_msg(f"[SAVED] {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
+    else:
+        time_dim = "forecast_period" if "forecast_period" in ds.dims else ("time" if "time" in ds.dims else None)
+        for day in unique_days:
+            out_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{day}.nc")
+            if time_dim:
+                mask = valid_times.strftime("%Y%m%d") == day
+                ds_day = ds.isel({time_dim: mask})
+            else:
+                ds_day = ds
+            _write_ds_streaming(ds_day, out_fp)
+            n_steps = ds_day.sizes.get(time_dim, 1) if time_dim else 1
+            log_msg(f"[SAVED-DAILY] {day} ({n_steps} timesteps) -> {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
+
+        base_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
+        if not os.path.exists(base_fp):
+            _write_ds_streaming(ds, base_fp)
+            log_msg(f"[SAVED-BASE] {base_fp}")
+
+
+def generate_tasks(args: argparse.Namespace) -> list[dict]:
+    dates = pd.period_range(start=args.start_date, end=args.end_date, freq="D")
+    times, leadtimes = resolve_time_and_leadtimes(args)
+    num_times = len(times)
+    ext = "grib" if args.format == "grib" else "zip"
+
+    all_levels = [str(l) for l in range(1, 138)]
+
+    effective_ghg = bool(getattr(args, "ghg", False) or getattr(args, "ghg_only", False))
+    if effective_ghg:
+        if args.type == "analysis" and not getattr(args, "ghg_only", False):
+            log_msg(
+                "[GHG-SKIP] cams-global-greenhouse-gas-forecasts is forecast-only (00:00 UTC); "
+                "skipping GHG stream for type='analysis'."
+            )
+            effective_ghg = False
+        elif "00:00" not in times:
+            raise ValueError("cams-global-greenhouse-gas-forecasts only supports 00:00 UTC base time.")
+
+    _, sfc_lt_chunks, sfc_f_per_lt, sfc_max_lt = compute_stream_chunking(
+        len(SURFACE_VARS),
+        None,
+        num_times,
+        leadtimes,
+        max_fields=args.max_fields,
+        explicit_lt_chunk=args.sfc_lt_chunk,
+        explicit_level_chunks=1,
+    )
+    met_lvl_chunks, met_lt_chunks, met_f_per_lt, met_max_lt = compute_stream_chunking(
+        len(UPPER_AIR_VARS),
+        all_levels,
+        num_times,
+        leadtimes,
+        max_fields=args.max_fields,
+        explicit_lt_chunk=args.met_lt_chunk,
+        explicit_level_chunks=args.level_chunks,
+    )
+    chem_lvl_chunks, chem_lt_chunks, chem_f_per_lt, chem_max_lt = compute_stream_chunking(
+        len(CHEM_VARS),
+        all_levels,
+        num_times,
+        leadtimes,
+        max_fields=args.max_fields,
+        explicit_lt_chunk=args.chem_lt_chunk,
+        explicit_level_chunks=args.level_chunks,
+    )
+
+    plan_lines = [
+        f"Chunking Plan (format={args.format}, max_fields={args.max_fields}, total_leadtimes={len(leadtimes)}):",
+        f"  - Regional Area: {getattr(args, 'area', 'global')}",
+        f"  - Surface (2D): {len(SURFACE_VARS)} vars x 1 lvl = {sfc_f_per_lt} fields/lt "
+        f"(max {sfc_max_lt} lts/req) -> {len(sfc_lt_chunks)} request(s), "
+        f"max {len(sfc_lt_chunks[0]) * sfc_f_per_lt} fields/req",
+        f"  - 3D Met      : {len(UPPER_AIR_VARS)} vars x {len(met_lvl_chunks[0])} lvls = {met_f_per_lt} fields/lt "
+        f"(max {met_max_lt} lts/req) -> {len(met_lt_chunks) * len(met_lvl_chunks)} request(s), "
+        f"max {len(met_lt_chunks[0]) * met_f_per_lt} fields/req",
+        f"  - 3D Chem     : {len(CHEM_VARS)} vars x {len(chem_lvl_chunks[0])} lvls = {chem_f_per_lt} fields/lt "
+        f"(max {chem_max_lt} lts/req) -> {len(chem_lt_chunks) * len(chem_lvl_chunks)} request(s), "
+        f"max {len(chem_lt_chunks[0]) * chem_f_per_lt} fields/req",
+    ]
+    ghg_lvl_chunks, ghg_lt_chunks = [], []
+    if effective_ghg:
+        ghg_lvl_chunks, ghg_lt_chunks, ghg_f_per_lt, ghg_max_lt = compute_stream_chunking(
+            len(GHG_VARS),
+            all_levels,
+            1,
+            leadtimes,
+            max_fields=args.max_fields,
+            explicit_lt_chunk=args.ghg_lt_chunk,
+            explicit_level_chunks=args.level_chunks,
+        )
+        plan_lines.append(
+            f"  - 3D GHG (0.1): {len(GHG_VARS)} vars x {len(ghg_lvl_chunks[0])} lvls = {ghg_f_per_lt} fields/lt "
+            f"(max {ghg_max_lt} lts/req) -> {len(ghg_lt_chunks) * len(ghg_lvl_chunks)} request(s), "
+            f"max {len(ghg_lt_chunks[0]) * ghg_f_per_lt} fields/req"
+        )
+    log_msg("\n".join(plan_lines))
+
+    tasks: list[dict] = []
+    date_specs: dict[str, dict] = {}
+    ac_collection = "cams-global-atmospheric-composition-forecasts"
+    ghg_collection = "cams-global-greenhouse-gas-forecasts"
+
+    for raw_date in dates:
+        date = raw_date.to_timestamp()
+        date_str = date.strftime("%Y%m%d")
+        date_dash = date.strftime("%Y-%m-%d")
+
+        if args.type == "forecast" and not getattr(args, "no_split_days", False):
+            max_lt = max(int(lt) for lt in leadtimes)
+            expected_days = [(date + pd.Timedelta(hours=h)).strftime("%Y%m%d") for h in range(0, max_lt + 1, 24)]
+        else:
+            expected_days = [date_str]
+
+        sfc_done = all(
+            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_sfc_{d}.nc")) for d in expected_days
+        )
+        ml_done = all(
+            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_ml_{d}.nc")) for d in expected_days
+        )
+        ghg_done = all(
+            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_ghg_{d}.nc")) for d in expected_days
+        )
+
+        ghg_only = bool(getattr(args, "ghg_only", False))
+        need_sfc = (not ghg_only) and (args.force or not sfc_done)
+        need_ml = (not args.sfc_only) and (not ghg_only) and (args.force or not ml_done)
+        need_ghg = effective_ghg and (not args.sfc_only) and (args.force or not ghg_done)
+
+        if not (need_sfc or need_ml or need_ghg):
+            log_msg(f"Skipping {date_str}, final merged daily NetCDF files already exist.")
+            continue
+
+        temp_raw_dir = os.path.join(args.data_root_folder, f"tmp_gribs_{date_str}")
+        temp_extract_dir = os.path.join(args.data_root_folder, f"tmp_extract_{date_str}")
+
+        date_spec = {
+            "date_str": date_str,
+            "temp_raw_dir": temp_raw_dir,
+            "temp_extract_dir": temp_extract_dir,
+            "all_markers": [],
+            "need_sfc": need_sfc,
+            "need_ml": need_ml,
+            "need_ghg": need_ghg,
+            "sfc_nc_files": [],
+            "met_nc_by_lvl": [[] for _ in range(len(met_lvl_chunks))] if need_ml else [],
+            "chem_nc_by_lvl": [[] for _ in range(len(chem_lvl_chunks))] if need_ml else [],
+            "ghg_nc_by_lvl": [[] for _ in range(len(ghg_lvl_chunks))] if need_ghg else [],
+        }
+        date_specs[date_str] = date_spec
+
+        # 1. Surface Tasks
+        if need_sfc:
+            for c_idx, lt_chunk in enumerate(sfc_lt_chunks):
+                base_name = "cams_sfc_all" if len(sfc_lt_chunks) == 1 else f"cams_sfc_chunk_{c_idx}"
+                raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+                nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+                marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+                lt_param = lt_chunk if args.type == "forecast" else "0"
+                num_fields = len(SURFACE_VARS) * len(lt_chunk) * num_times
+
+                sfc_req: dict[str, Any] = {
+                    "variable": SURFACE_VARS,
+                    "date": f"{date_dash}/{date_dash}",
+                    "time": times,
+                    "data_format": args.format,
+                    "type": args.type,
+                    "leadtime_hour": lt_param,
+                }
+                if getattr(args, "area", None):
+                    sfc_req["area"] = [float(x) for x in args.area]
+                date_spec["all_markers"].append(marker_fp)
+                date_spec["sfc_nc_files"].append(nc_fp)
+
+                tasks.append(
+                    {
+                        "name": f"{date_str}:{base_name}",
+                        "collection": ac_collection,
+                        "date_str": date_str,
+                        "date_spec": date_spec,
+                        "temp_raw_dir": temp_raw_dir,
+                        "temp_extract_dir": temp_extract_dir,
+                        "request": sfc_req,
+                        "output_raw": raw_fp,
+                        "output_nc": nc_fp,
+                        "marker": marker_fp,
+                        "format": args.format,
+                        "is_3d": False,
+                        "num_fields": num_fields,
+                        "lt_chunk": lt_chunk,
+                    }
+                )
+
+        # 2. 3D Met & Chem Tasks
+        if need_ml:
+            for l_idx, lvl_chunk in enumerate(met_lvl_chunks):
+                for c_idx, lt_chunk in enumerate(met_lt_chunks):
+                    lvl_suffix = "" if len(met_lvl_chunks) == 1 else f"_part{l_idx}"
+                    base_name = f"cams_met_chunk_{c_idx}{lvl_suffix}"
+                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+                    lt_param = lt_chunk if args.type == "forecast" else "0"
+                    num_fields = len(UPPER_AIR_VARS) * len(lvl_chunk) * len(lt_chunk) * num_times
+
+                    met_req: dict[str, Any] = {
+                        "variable": UPPER_AIR_VARS,
+                        "model_level": lvl_chunk,
+                        "date": f"{date_dash}/{date_dash}",
+                        "time": times,
+                        "data_format": args.format,
+                        "type": args.type,
+                        "leadtime_hour": lt_param,
+                    }
+                    if getattr(args, "area", None):
+                        met_req["area"] = [float(x) for x in args.area]
+                    date_spec["all_markers"].append(marker_fp)
+                    date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
+
+                    tasks.append(
+                        {
+                            "name": f"{date_str}:{base_name}",
+                            "collection": ac_collection,
+                            "date_str": date_str,
+                            "date_spec": date_spec,
+                            "temp_raw_dir": temp_raw_dir,
+                            "temp_extract_dir": temp_extract_dir,
+                            "request": met_req,
+                            "output_raw": raw_fp,
+                            "output_nc": nc_fp,
+                            "marker": marker_fp,
+                            "format": args.format,
+                            "is_3d": True,
+                            "num_fields": num_fields,
+                            "lt_chunk": lt_chunk,
+                        }
+                    )
+
+            for l_idx, lvl_chunk in enumerate(chem_lvl_chunks):
+                for c_idx, lt_chunk in enumerate(chem_lt_chunks):
+                    lvl_suffix = "" if len(chem_lvl_chunks) == 1 else f"_part{l_idx}"
+                    if len(lt_chunk) == 1:
+                        base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
+                    else:
+                        base_name = f"cams_chem_chunk_{c_idx}{lvl_suffix}"
+                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+                    lt_param = lt_chunk if args.type == "forecast" else "0"
+                    num_fields = len(CHEM_VARS) * len(lvl_chunk) * len(lt_chunk) * num_times
+
+                    chem_req: dict[str, Any] = {
+                        "variable": CHEM_VARS,
+                        "model_level": lvl_chunk,
+                        "date": f"{date_dash}/{date_dash}",
+                        "time": times,
+                        "data_format": args.format,
+                        "type": args.type,
+                        "leadtime_hour": lt_param,
+                    }
+                    if getattr(args, "area", None):
+                        chem_req["area"] = [float(x) for x in args.area]
+                    date_spec["all_markers"].append(marker_fp)
+                    date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
+
+                    tasks.append(
+                        {
+                            "name": f"{date_str}:{base_name}",
+                            "collection": ac_collection,
+                            "date_str": date_str,
+                            "date_spec": date_spec,
+                            "temp_raw_dir": temp_raw_dir,
+                            "temp_extract_dir": temp_extract_dir,
+                            "request": chem_req,
+                            "output_raw": raw_fp,
+                            "output_nc": nc_fp,
+                            "marker": marker_fp,
+                            "format": args.format,
+                            "is_3d": True,
+                            "num_fields": num_fields,
+                            "lt_chunk": lt_chunk,
+                        }
+                    )
+
+        # 3. 3D GHG Tasks (0.1 deg CO2 & CH4; forecast-only at 00:00 UTC)
+        if need_ghg:
+            for l_idx, lvl_chunk in enumerate(ghg_lvl_chunks):
+                for c_idx, lt_chunk in enumerate(ghg_lt_chunks):
+                    lvl_suffix = "" if len(ghg_lvl_chunks) == 1 else f"_part{l_idx}"
+                    base_name = f"cams_ghg_chunk_{c_idx}{lvl_suffix}"
+                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+                    num_fields = len(GHG_VARS) * len(lvl_chunk) * len(lt_chunk)
+
+                    ghg_req: dict[str, Any] = {
+                        "variable": GHG_VARS,
+                        "model_level": lvl_chunk,
+                        "date": f"{date_dash}/{date_dash}",
+                        "data_format": args.format,
+                        "leadtime_hour": lt_chunk,
+                    }
+                    if getattr(args, "area", None):
+                        ghg_req["area"] = [float(x) for x in args.area]
+                    date_spec["all_markers"].append(marker_fp)
+                    date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
+
+                    tasks.append(
+                        {
+                            "name": f"{date_str}:{base_name}",
+                            "collection": ghg_collection,
+                            "date_str": date_str,
+                            "date_spec": date_spec,
+                            "temp_raw_dir": temp_raw_dir,
+                            "temp_extract_dir": temp_extract_dir,
+                            "request": ghg_req,
+                            "output_raw": raw_fp,
+                            "output_nc": nc_fp,
+                            "marker": marker_fp,
+                            "format": args.format,
+                            "is_3d": True,
+                            "num_fields": num_fields,
+                            "lt_chunk": lt_chunk,
+                        }
+                    )
+
+    return tasks
+
+
+def is_http_400_error(exc: Exception) -> bool:
+    msg = str(exc)
+    if "The job has failed" in msg:
+        return False
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 400:
+        return True
+    if "400 Client Error" in msg or "400 Bad Request" in msg:
+        return True
+    return False
+
+
+def _merge_and_save_3d_groups(stream: str, nc_by_lvl_groups, date_str: str, args: argparse.Namespace) -> None:
+    opened = []
+    lvl_merged_datasets = []
+    try:
+        num_lvl_groups = max(len(group) for group in nc_by_lvl_groups)
+        for l_idx in range(num_lvl_groups):
+            group_merged = []
+            for group in nc_by_lvl_groups:
+                files = group[min(l_idx, len(group) - 1)]
+                ds_list = [xr.open_dataset(f, chunks={"forecast_period": 1}) for f in files]
+                opened.extend(ds_list)
+                ds_cat = (
+                    ds_list[0]
+                    if len(ds_list) == 1
+                    else xr.concat(
+                        ds_list, dim="forecast_period", data_vars="minimal", coords="minimal", compat="override"
+                    ).sortby("forecast_period")
+                )
+                group_merged.append(ds_cat)
+
+            ds_lvl = group_merged[0] if len(group_merged) == 1 else xr.merge(group_merged, compat="override")
+            lvl_merged_datasets.append(ds_lvl)
+
+        if len(lvl_merged_datasets) == 1:
+            ds_final = lvl_merged_datasets[0]
+        else:
+            lvl_dim = "model_level" if "model_level" in lvl_merged_datasets[0].dims else "level"
+            ds_final = xr.concat(lvl_merged_datasets, dim=lvl_dim).sortby(lvl_dim)
+
+        save_dataset_daily_and_base(
+            ds_final,
+            stream,
+            date_str,
+            args.data_root_folder,
+            no_split_days=getattr(args, "no_split_days", False),
+        )
+    finally:
+        for ds in opened:
+            ds.close()
+
+
+def check_and_merge(date_spec: dict, args: argparse.Namespace) -> None:
+    date_str = date_spec["date_str"]
+    temp_raw_dir = date_spec["temp_raw_dir"]
+    temp_extract_dir = date_spec["temp_extract_dir"]
+
+    for marker_fp in date_spec["all_markers"]:
+        if not os.path.exists(marker_fp):
+            return
+
+    lock_dir = os.path.join(temp_raw_dir, f"merge_{date_str}.lockdir")
+    try:
+        os.mkdir(lock_dir)
+    except FileExistsError:
+        return
+
+    t_merge_start = time.time()
+    try:
+        log_msg(f"[MERGE-START] All {len(date_spec['all_markers'])} chunks for {date_str} are complete. Merging...")
+
+        if date_spec.get("need_sfc") and date_spec.get("sfc_nc_files"):
+            sfc_files = date_spec["sfc_nc_files"]
+            opened_sfc = [xr.open_dataset(f, chunks={"forecast_period": 1}) for f in sfc_files]
+            try:
+                if len(opened_sfc) == 1:
+                    ds_sfc = opened_sfc[0]
+                else:
+                    ds_sfc = xr.concat(opened_sfc, dim="forecast_period").sortby("forecast_period")
+
+                save_dataset_daily_and_base(
+                    ds_sfc,
+                    "sfc",
+                    date_str,
+                    args.data_root_folder,
+                    no_split_days=getattr(args, "no_split_days", False),
+                )
+            finally:
+                for ds in opened_sfc:
+                    ds.close()
+
+        if date_spec.get("need_ml"):
+            _merge_and_save_3d_groups("ml", [date_spec["met_nc_by_lvl"], date_spec["chem_nc_by_lvl"]], date_str, args)
+
+        if date_spec.get("need_ghg") and date_spec.get("ghg_nc_by_lvl"):
+            _merge_and_save_3d_groups("ghg", [date_spec["ghg_nc_by_lvl"]], date_str, args)
+
+        log_msg(
+            f"[MERGE-DONE] Full merge and daily slicing for {date_str} completed in {time.time() - t_merge_start:.1f}s."
+        )
+
+    except Exception as e:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        log_msg(f"[MERGE-ERROR] Error during merge for {date_str}: {e}")
+        raise
+
+    try:
+        shutil.rmtree(temp_raw_dir, ignore_errors=True)
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        log_msg(f"[CLEANUP] Removed temporary directories for {date_str}.")
+    except Exception as e:
+        log_msg(f"[CLEANUP-WARN] Could not fully clean up temp directories: {e}")
+
+
+def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: bool = False) -> None:
+    os.makedirs(task["temp_raw_dir"], exist_ok=True)
+    os.makedirs(task["temp_extract_dir"], exist_ok=True)
+
+    if getattr(args, "force", False):
+        for fp in (task["marker"], task["output_raw"], task["output_nc"]):
+            if os.path.exists(fp):
+                os.remove(fp)
+
+    if os.path.exists(task["marker"]) and os.path.exists(task["output_nc"]):
+        nc_size_mb = os.path.getsize(task["output_nc"]) / (1024.0 * 1024.0)
+        log_msg(f"[SKIPPED] {task['name']} | Already completed ({os.path.basename(task['output_nc'])}, {nc_size_mb:.2f} MB)")
+    else:
+        t_chunk_start = time.time()
+        lt_desc = (
+            f"{task['lt_chunk'][0]}..{task['lt_chunk'][-1]}h ({len(task['lt_chunk'])} steps)"
+            if len(task["lt_chunk"]) > 1
+            else f"{task['lt_chunk'][0]}h"
+        )
+
+        need_download = True
+        if os.path.exists(task["output_raw"]) and os.path.getsize(task["output_raw"]) > 0:
+            raw_size_mb = os.path.getsize(task["output_raw"]) / (1024.0 * 1024.0)
+            log_msg(
+                f"[FOUND-RAW] {task['name']} | Found existing {os.path.basename(task['output_raw'])} "
+                f"({raw_size_mb:.2f} MB), attempting conversion..."
+            )
+            try:
+                t_conv_start = time.time()
+                if task["format"] == "grib":
+                    convert_grib_to_cdm_nc(task["output_raw"], task["output_nc"], is_3d=task["is_3d"])
+                else:
+                    extract_subdir = os.path.join(
+                        task["temp_extract_dir"], f"unzip_{os.path.basename(task['output_raw'])}"
+                    )
+                    extract_nc_from_zip_to_target(task["output_raw"], task["output_nc"], extract_subdir)
+                conv_elapsed = time.time() - t_conv_start
+                nc_size_mb = os.path.getsize(task["output_nc"]) / (1024.0 * 1024.0)
+                with open(task["marker"], "w", encoding="utf-8") as f:
+                    f.write("DONE\n")
+                log_msg(
+                    f"[CONVERTED] {task['name']} | netcdf={os.path.basename(task['output_nc'])} ({nc_size_mb:.2f} MB) | "
+                    f"conv_elapsed={conv_elapsed:.1f}s"
+                )
+                need_download = False
+            except Exception as conv_err:
+                log_msg(
+                    f"[RAW-INCOMPLETE] {task['name']} | Existing {os.path.basename(task['output_raw'])} "
+                    f"failed conversion ({conv_err}); re-downloading..."
+                )
+                try:
+                    os.remove(task["output_raw"])
+                except OSError:
+                    pass
+
+        if need_download:
+            log_msg(
+                f"[SUBMITTED] {task['name']} | format={task['format']} | fields={task['num_fields']} | "
+                f"leadtimes={lt_desc} -> {os.path.basename(task['output_raw'])}"
+            )
+
+            max_retries = max(0, int(getattr(args, "max_retries", 3)))
+            c = client or get_thread_cds_client()
+
+            for attempt in range(max_retries + 1):
+                t_req_start = time.time()
+                try:
+                    c.retrieve(
+                        task.get("collection", "cams-global-atmospheric-composition-forecasts"),
+                        task["request"],
+                        task["output_raw"],
+                    )
+                    dl_elapsed = time.time() - t_req_start
+                    raw_size_mb = os.path.getsize(task["output_raw"]) / (1024.0 * 1024.0)
+                    log_msg(
+                        f"[COMPLETED] {task['name']} | file={os.path.basename(task['output_raw'])} | "
+                        f"size={raw_size_mb:.2f} MB | download_elapsed={dl_elapsed:.1f}s ({dl_elapsed / 60.0:.2f}m)"
+                    )
+                    break
+                except Exception as e:
+                    if os.path.exists(task["output_raw"]):
+                        try:
+                            os.remove(task["output_raw"])
+                        except OSError:
+                            pass
+
+                    if is_http_400_error(e):
+                        log_msg(f"[FAILED-FAST] {task['name']} | Non-retryable HTTP 400 Bad Request: {e}")
+                        raise
+
+                    if attempt < max_retries:
+                        backoff_s = (2**attempt) * 15
+                        log_msg(
+                            f"[RETRY {attempt + 1}/{max_retries}] {task['name']} | "
+                            f"Transient error: {e} | Waiting {backoff_s}s before retry..."
+                        )
+                        time.sleep(backoff_s)
+                        c = reset_thread_cds_client()
+                    else:
+                        log_msg(f"[FAILED] {task['name']} | Exhausted {max_retries} retries. Last error: {e}")
+                        raise
+
+            t_conv_start = time.time()
+            if task["format"] == "grib":
+                convert_grib_to_cdm_nc(task["output_raw"], task["output_nc"], is_3d=task["is_3d"])
+            else:
+                extract_subdir = os.path.join(
+                    task["temp_extract_dir"], f"unzip_{os.path.basename(task['output_raw'])}"
+                )
+                extract_nc_from_zip_to_target(task["output_raw"], task["output_nc"], extract_subdir)
+
+            conv_elapsed = time.time() - t_conv_start
+            total_elapsed = time.time() - t_chunk_start
+            nc_size_mb = os.path.getsize(task["output_nc"]) / (1024.0 * 1024.0)
+
+            with open(task["marker"], "w", encoding="utf-8") as f:
+                f.write("DONE\n")
+
+            log_msg(
+                f"[CONVERTED] {task['name']} | netcdf={os.path.basename(task['output_nc'])} ({nc_size_mb:.2f} MB) | "
+                f"conv_elapsed={conv_elapsed:.1f}s | total_chunk_wall={total_elapsed:.1f}s ({total_elapsed / 60.0:.2f}m)"
+            )
+
+    if not defer_merge:
+        check_and_merge(task["date_spec"], args)
+
+
+def execute_cams_pipeline(args: argparse.Namespace) -> list[dict]:
+    """Execute or plan the CAMS download & daily CDM NetCDF merge pipeline."""
+    tasks = generate_tasks(args)
+
+    if getattr(args, "list_tasks", False):
+        print(f"{len(tasks)} tasks (0..{len(tasks) - 1})")
+        return tasks
+
+    if not tasks:
+        log_msg("No pending tasks to execute.")
+        return tasks
+
+    if args.task_index is not None:
+        if args.task_index < 0 or args.task_index >= len(tasks):
+            raise ValueError(f"task_index {args.task_index} is out of bounds (0..{len(tasks) - 1})")
+        task = tasks[args.task_index]
+        run_task(task, args, defer_merge=False)
+        return tasks
+
+    max_workers = max(1, int(args.max_workers))
+    log_msg(f"Starting ThreadPoolExecutor queue pipeline with max_workers={max_workers} across {len(tasks)} total tasks...")
+
+    t_all_start = time.time()
+    failures: list[tuple[str, Exception]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {executor.submit(run_task, task, args, None, True): task for task in tasks}
+        for future in concurrent.futures.as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append((task["name"], exc))
+                log_msg(f"[TASK-ERROR] {task['name']} raised exception: {exc}")
+
+    if failures:
+        log_msg(f"Pipeline failed with {len(failures)} failed task(s):")
+        for name, exc in failures:
+            log_msg(f"  - {name}: {exc}")
+        raise RuntimeError(f"CAMS fetch pipeline failed ({len(failures)} failed task(s)).")
+
+    seen_dates: set[str] = set()
+    for task in tasks:
+        d_str = task["date_str"]
+        if d_str not in seen_dates:
+            seen_dates.add(d_str)
+            check_and_merge(task["date_spec"], args)
+
+    total_wall = time.time() - t_all_start
+    log_msg(
+        f"[ALL-COMPLETE] All {len(tasks)} tasks and daily merges finished in {total_wall:.1f}s ({total_wall / 60.0:.2f}m)."
+    )
+    return tasks
+
+
+def download_cams_forecast(
+    start_date: str,
+    end_date: str,
+    data_root_folder: str | Path,
+    *,
+    config: str | Path | None = None,
+    data_format: str | None = None,
+    max_fields: int | None = None,
+    sfc_lt_chunk: int | None = None,
+    met_lt_chunk: int | None = None,
+    chem_lt_chunk: int | None = None,
+    ghg_lt_chunk: int | None = None,
+    ghg: bool | None = None,
+    ghg_only: bool = False,
+    level_chunks: int | None = None,
+    max_workers: int | None = None,
+    max_retries: int | None = None,
+    list_tasks: bool = False,
+    task_index: int | None = None,
+    sfc_only: bool = False,
+    force: bool = False,
+    cams_type: str | None = None,
+    cams_time: str | None = None,
+    area: Sequence[float] | None = None,
+    leadtimes: Sequence[str | int] | str | None = None,
+    no_split_days: bool = False,
+) -> list[dict]:
+    """Programmatic entry point matching the CAMS GRIB pipelined downloader CLI."""
+    if leadtimes is not None:
+        if isinstance(leadtimes, (list, tuple)):
+            norm_lts = [str(x) for x in leadtimes]
+        else:
+            norm_lts = [str(leadtimes)]
+    else:
+        norm_lts = None
+
+    ns = argparse.Namespace(
+        mode=None,
+        start_date=str(start_date),
+        end_date=str(end_date),
+        data_root_folder=str(data_root_folder),
+        config=str(config) if config is not None else None,
+        format=data_format,
+        max_fields=max_fields,
+        sfc_lt_chunk=sfc_lt_chunk,
+        met_lt_chunk=met_lt_chunk,
+        chem_lt_chunk=chem_lt_chunk,
+        ghg_lt_chunk=ghg_lt_chunk,
+        ghg=ghg,
+        ghg_only=bool(ghg_only),
+        level_chunks=level_chunks,
+        max_workers=max_workers,
+        max_retries=max_retries,
+        list_tasks=bool(list_tasks),
+        task_index=task_index,
+        sfc_only=bool(sfc_only),
+        force=bool(force),
+        type=cams_type,
+        time=cams_time,
+        area=list(area) if area is not None else None,
+        leadtimes=norm_lts,
+        no_split_days=bool(no_split_days),
+    )
+    apply_config_and_defaults(ns)
+    return execute_cams_pipeline(ns)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    try:
+        execute_cams_pipeline(args)
+    except (RuntimeError, ValueError) as exc:
+        log_msg(f"Error: {exc}")
+        sys.exit(1)

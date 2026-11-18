@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airblender"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unified atmospheric meteorology, chemistry, and aerosol coupler (CAMS/MERRA-2/EMAC -> WPS/WRF-Chem -> PALM-4U)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,15 @@ dependencies = [
     "pandas",
     "pyproj",
     "pyyaml",
+]
+
+[project.optional-dependencies]
+fetch = [
+    "cdsapi",
+    "cfgrib",
+    "eccodes",
+    "ecmwf-opendata",
+    "ecmwf-api-client",
 ]
 
 [project.scripts]
