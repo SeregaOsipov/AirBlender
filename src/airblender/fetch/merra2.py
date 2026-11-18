@@ -10,6 +10,13 @@ from typing import Sequence
 
 import pandas as pd
 
+'''
+Recommended CLI usage:
+```bash
+airblender fetch-merra2 --start_date 2021-01-01 --ndays 365 --outdir . --preset wrfchem
+```
+'''
+
 MERRA2_COLLECTIONS: dict[str, str] = {
     "inst3_3d_asm_Nv": "https://goldsmr5.gesdisc.eosdis.nasa.gov/data/MERRA2/M2I3NVASM.5.12.4",
     "inst1_2d_asm_Nx": "https://goldsmr4.gesdisc.eosdis.nasa.gov/data/MERRA2/M2I1NXASM.5.12.4",
