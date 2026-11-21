@@ -551,6 +551,142 @@ def test_fetch_subpackage() -> None:
     print("  -> Test 4 PASSED.")
 
 
+def test_cams_stream_daily() -> None:
+    print("[Test 5] airblender.fetch CAMS daily-horizon streaming and incremental flushing...")
+    import argparse
+    import time as _time
+    import pandas as pd
+    import xarray as xr
+    from airblender.fetch.cams_forecast import (
+        apply_config_and_defaults,
+        check_and_flush_horizons,
+        generate_tasks,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="airblender_stream_") as td:
+        stream_dir = Path(td) / "cams_stream"
+        ns = argparse.Namespace(
+            mode=None,
+            start_date="2026-11-14",
+            end_date="2026-11-14",
+            data_root_folder=str(stream_dir),
+            config=None,
+            format="grib",
+            max_fields=10000,
+            sfc_lt_chunk=None,
+            met_lt_chunk=None,
+            chem_lt_chunk=None,
+            ghg_lt_chunk=None,
+            ghg=True,
+            ghg_only=False,
+            level_chunks=None,
+            max_workers=5,
+            max_retries=3,
+            list_tasks=True,
+            task_index=None,
+            sfc_only=False,
+            force=False,
+            type="forecast",
+            time="00:00",
+            area=None,
+            leadtimes=None,
+            no_split_days=False,
+            stream_daily=True,
+            segment_hours=24,
+        )
+        apply_config_and_defaults(ns)
+        tasks = generate_tasks(ns)
+        assert len(tasks) == 52, f"Expected 52 tasks across 5 daily buckets, got {len(tasks)}"
+        date_spec = tasks[0]["date_spec"]
+        assert [h["horizon_h"] for h in date_spec["horizons"]] == [24, 48, 72, 96, 120]
+        # Bucket 1 (tasks[:12]) must strictly stay within 0..24h for 3D met/chem/ghg (and 0..120h sfc)
+        assert all(max(int(lt) for lt in t["lt_chunk"]) <= 24 for t in tasks[1:12])
+        assert max(int(lt) for lt in tasks[0]["lt_chunk"]) == 120  # single sfc_all request covers 0..120h
+
+        pv = np.array([2000.0, 50000.0, 0.0, 0.0, 0.4, 1.0], dtype=np.float32)
+        base_dt = pd.Timestamp("2026-11-14T00:00:00")
+
+        def _populate_task_chunks(task_slice: list[dict]) -> None:
+            for t in task_slice:
+                nc_fp = Path(t["output_nc"])
+                marker_fp = Path(t["marker"])
+                nc_fp.parent.mkdir(parents=True, exist_ok=True)
+                marker_fp.parent.mkdir(parents=True, exist_ok=True)
+                lts = [int(x) for x in t["lt_chunk"]]
+                vtimes = np.array([base_dt + pd.Timedelta(hours=h) for h in lts], dtype="datetime64[ns]")
+                name = t["name"]
+                if ":cams_sfc" in name:
+                    ds = xr.Dataset(
+                        data_vars={
+                            "t2m": (
+                                ("forecast_period", "latitude", "longitude"),
+                                np.full((len(lts), 2, 2), 300.0, dtype=np.float32),
+                            )
+                        },
+                        coords={
+                            "forecast_period": lts,
+                            "valid_time": ("forecast_period", vtimes),
+                            "latitude": [26.0, 25.0],
+                            "longitude": [50.0, 51.0],
+                        },
+                    )
+                else:
+                    if ":cams_met" in name:
+                        vname = "u"
+                    elif ":cams_chem" in name:
+                        vname = "go3"
+                    else:
+                        vname = "co2"
+                    ds = xr.Dataset(
+                        data_vars={
+                            vname: (
+                                ("forecast_period", "model_level", "latitude", "longitude"),
+                                np.full((len(lts), 2, 2, 2), 1.0e-6, dtype=np.float32),
+                                {"GRIB_pv": pv},
+                            )
+                        },
+                        coords={
+                            "forecast_period": lts,
+                            "valid_time": ("forecast_period", vtimes),
+                            "model_level": [1, 2],
+                            "latitude": [26.0, 25.0],
+                            "longitude": [50.0, 51.0],
+                        },
+                    )
+                ds.to_netcdf(nc_fp, encoding={"valid_time": {"units": "seconds since 1970-01-01", "dtype": "int64"}})
+                marker_fp.write_text("DONE\n", encoding="utf-8")
+
+        # Populate ONLY Bucket 1 (0..24h = 12 tasks)
+        _populate_task_chunks(tasks[:12])
+        check_and_flush_horizons(date_spec, ns)
+        assert (stream_dir / ".cams_ready_20261114_h024.done").is_file()
+        assert not (stream_dir / ".cams_ready_20261114_h048.done").exists()
+
+        for stream in ("sfc", "ml", "ghg"):
+            with xr.open_dataset(stream_dir / f"ECMWF-CAMS_{stream}_20261114.nc") as ds_d0:
+                assert ds_d0.sizes["forecast_period"] == 8, f"{stream} day0 steps={ds_d0.sizes['forecast_period']}"
+        for stream in ("ml", "ghg"):
+            with xr.open_dataset(stream_dir / f"ECMWF-CAMS_{stream}_20261115.nc") as ds_d1:
+                assert ds_d1.sizes["forecast_period"] == 1, f"{stream} day1 steps={ds_d1.sizes['forecast_period']}"
+
+        # Verify completed Day 0 ml file is NOT rewritten when Bucket 2 flushes
+        ml_day0 = stream_dir / "ECMWF-CAMS_ml_20261114.nc"
+        mtime_day0 = ml_day0.stat().st_mtime_ns
+        _time.sleep(0.02)
+
+        # Populate Bucket 2 (27..48h = 10 tasks)
+        _populate_task_chunks(tasks[12:22])
+        check_and_flush_horizons(date_spec, ns)
+        assert (stream_dir / ".cams_ready_20261114_h048.done").is_file()
+        assert ml_day0.stat().st_mtime_ns == mtime_day0, "Completed Day 0 file should not be rewritten on Bucket 2 flush"
+
+        with xr.open_dataset(stream_dir / "ECMWF-CAMS_ml_20261115.nc") as ds_d1:
+            assert ds_d1.sizes["forecast_period"] == 8
+        with xr.open_dataset(stream_dir / "ECMWF-CAMS_ml_20261116.nc") as ds_d2:
+            assert ds_d2.sizes["forecast_period"] == 1
+    print("  -> Test 5 PASSED.")
+
+
 def main() -> None:
     print("=" * 68)
     print(" Running AirBlender Verification Suite")
@@ -559,6 +695,7 @@ def main() -> None:
     test_unified_cams_merra2_emac_icbc()
     test_cams2wps_and_wrf2palm()
     test_fetch_subpackage()
+    test_cams_stream_daily()
     print("=" * 68)
     print(" ALL AIRBLENDER CHECKS PASSED (100% OK)")
     print("=" * 68)

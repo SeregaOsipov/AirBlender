@@ -36,6 +36,7 @@ import yaml
 
 _PRINT_LOCK = threading.Lock()
 _NETCDF_LOCK = threading.Lock()
+_MERGE_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
 
 SURFACE_VARS = [
@@ -263,6 +264,18 @@ def build_arg_parser(parser: argparse.ArgumentParser | None = None) -> argparse.
         action="store_true",
         help="Do not split multi-day forecasts into daily files",
     )
+    parser.add_argument(
+        "--stream_daily",
+        action="store_true",
+        default=None,
+        help="Order ADS requests day-by-day (0..24h first) and incrementally flush daily NetCDFs as each horizon completes",
+    )
+    parser.add_argument(
+        "--segment_hours",
+        type=int,
+        default=None,
+        help="Forecast horizon bucket size in hours when --stream_daily is enabled (default: 24)",
+    )
     return parser
 
 
@@ -293,6 +306,8 @@ def apply_config_and_defaults(args: argparse.Namespace) -> None:
     args.level_chunks = int(pick(args.level_chunks, "cams_level_chunks", 1))
     args.max_workers = int(pick(args.max_workers, "cams_max_workers", 5))
     args.max_retries = int(pick(args.max_retries, "cams_max_retries", 3))
+    args.stream_daily = bool(pick(getattr(args, "stream_daily", None), "cams_stream_daily", False))
+    args.segment_hours = max(3, int(pick(getattr(args, "segment_hours", None), "cams_segment_hours", 24)))
     if args.leadtimes is None and "cams_leadtimes" in cfg_data and cfg_data["cams_leadtimes"] is not None:
         lt_cfg = cfg_data["cams_leadtimes"]
         args.leadtimes = [str(x) for x in lt_cfg] if isinstance(lt_cfg, list) else [str(lt_cfg)]
@@ -580,8 +595,25 @@ def _write_ds_streaming(ds_out: xr.Dataset, target_fp: str) -> None:
                 pass
 
 
+def _existing_nc_steps(fp: str, time_dim: str | None) -> int:
+    if not os.path.exists(fp):
+        return 0
+    try:
+        with netCDF4.Dataset(fp, "r") as nc_chk:
+            if time_dim and time_dim in nc_chk.dimensions:
+                return len(nc_chk.dimensions[time_dim])
+            return 1
+    except Exception:
+        return 0
+
+
 def save_dataset_daily_and_base(
-    ds: xr.Dataset, stream: str, date_str: str, data_root_folder: str | Path, no_split_days: bool = False
+    ds: xr.Dataset,
+    stream: str,
+    date_str: str,
+    data_root_folder: str | Path,
+    no_split_days: bool = False,
+    skip_if_steps_ge: bool = False,
 ) -> None:
     """
     Save `ds` into `data_root_folder` as `ECMWF-CAMS_{stream}_{YYYYMMDD}.nc` daily slices
@@ -601,12 +633,15 @@ def save_dataset_daily_and_base(
     else:
         unique_days = [date_str]
 
+    time_dim = "forecast_period" if "forecast_period" in ds.dims else ("time" if "time" in ds.dims else None)
     if no_split_days or len(unique_days) <= 1:
         out_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
+        n_steps = ds.sizes.get(time_dim, 1) if time_dim else 1
+        if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim) >= n_steps:
+            return
         _write_ds_streaming(ds, out_fp)
         log_msg(f"[SAVED] {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
     else:
-        time_dim = "forecast_period" if "forecast_period" in ds.dims else ("time" if "time" in ds.dims else None)
         for day in unique_days:
             out_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{day}.nc")
             if time_dim:
@@ -614,8 +649,10 @@ def save_dataset_daily_and_base(
                 ds_day = ds.isel({time_dim: mask})
             else:
                 ds_day = ds
-            _write_ds_streaming(ds_day, out_fp)
             n_steps = ds_day.sizes.get(time_dim, 1) if time_dim else 1
+            if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim) >= n_steps:
+                continue
+            _write_ds_streaming(ds_day, out_fp)
             log_msg(f"[SAVED-DAILY] {day} ({n_steps} timesteps) -> {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
 
         base_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
@@ -624,11 +661,136 @@ def save_dataset_daily_and_base(
             log_msg(f"[SAVED-BASE] {base_fp}")
 
 
+def _build_horizon_buckets(leadtimes: list[str], segment_hours: int) -> list[tuple[int, list[str]]]:
+    """Partition sorted forecast lead times into cumulative ``segment_hours`` buckets."""
+    sorted_lts = sorted(leadtimes, key=lambda x: int(x))
+    max_lt = max(int(lt) for lt in sorted_lts)
+    seg_h = max(3, int(segment_hours))
+    buckets: list[tuple[int, list[str]]] = []
+    prev_h = -1
+    cur_h = seg_h
+    while True:
+        bound_h = min(max_lt, cur_h)
+        b_lts = [lt for lt in sorted_lts if prev_h < int(lt) <= bound_h]
+        if b_lts:
+            buckets.append((bound_h, b_lts))
+        if bound_h >= max_lt:
+            break
+        prev_h = bound_h
+        cur_h += seg_h
+    return buckets
+
+
+def _make_sfc_task(
+    *,
+    date_str: str,
+    date_dash: str,
+    base_name: str,
+    lt_chunk: list[str],
+    times: list[str],
+    args: argparse.Namespace,
+    date_spec: dict,
+    temp_raw_dir: str,
+    temp_extract_dir: str,
+    ac_collection: str,
+) -> tuple[dict, str, str]:
+    ext = "grib" if args.format == "grib" else "zip"
+    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+    lt_param = lt_chunk if args.type == "forecast" else "0"
+    num_fields = len(SURFACE_VARS) * len(lt_chunk) * len(times)
+    req: dict[str, Any] = {
+        "variable": SURFACE_VARS,
+        "date": f"{date_dash}/{date_dash}",
+        "time": times,
+        "data_format": args.format,
+        "type": args.type,
+        "leadtime_hour": lt_param,
+    }
+    if getattr(args, "area", None):
+        req["area"] = [float(x) for x in args.area]
+    task = {
+        "name": f"{date_str}:{base_name}",
+        "collection": ac_collection,
+        "date_str": date_str,
+        "date_spec": date_spec,
+        "temp_raw_dir": temp_raw_dir,
+        "temp_extract_dir": temp_extract_dir,
+        "request": req,
+        "output_raw": raw_fp,
+        "output_nc": nc_fp,
+        "marker": marker_fp,
+        "format": args.format,
+        "is_3d": False,
+        "num_fields": num_fields,
+        "lt_chunk": lt_chunk,
+    }
+    return task, marker_fp, nc_fp
+
+
+def _make_3d_task(
+    *,
+    collection: str,
+    variables: list[str],
+    date_str: str,
+    date_dash: str,
+    base_name: str,
+    lvl_chunk: list[str],
+    lt_chunk: list[str],
+    times: list[str] | None,
+    include_type: bool,
+    args: argparse.Namespace,
+    date_spec: dict,
+    temp_raw_dir: str,
+    temp_extract_dir: str,
+) -> tuple[dict, str, str]:
+    ext = "grib" if args.format == "grib" else "zip"
+    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
+    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
+    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
+    lt_param = lt_chunk if args.type == "forecast" else "0"
+    num_times = len(times) if times else 1
+    num_fields = len(variables) * len(lvl_chunk) * len(lt_chunk) * num_times
+    req: dict[str, Any] = {
+        "variable": variables,
+        "model_level": lvl_chunk,
+        "date": f"{date_dash}/{date_dash}",
+        "data_format": args.format,
+        "leadtime_hour": lt_param,
+    }
+    if times is not None:
+        req["time"] = times
+    if include_type:
+        req["type"] = args.type
+    if getattr(args, "area", None):
+        req["area"] = [float(x) for x in args.area]
+    task = {
+        "name": f"{date_str}:{base_name}",
+        "collection": collection,
+        "date_str": date_str,
+        "date_spec": date_spec,
+        "temp_raw_dir": temp_raw_dir,
+        "temp_extract_dir": temp_extract_dir,
+        "request": req,
+        "output_raw": raw_fp,
+        "output_nc": nc_fp,
+        "marker": marker_fp,
+        "format": args.format,
+        "is_3d": True,
+        "num_fields": num_fields,
+        "lt_chunk": lt_chunk,
+    }
+    return task, marker_fp, nc_fp
+
+
 def generate_tasks(args: argparse.Namespace) -> list[dict]:
     dates = pd.period_range(start=args.start_date, end=args.end_date, freq="D")
     times, leadtimes = resolve_time_and_leadtimes(args)
     num_times = len(times)
-    ext = "grib" if args.format == "grib" else "zip"
+    stream_daily = bool(getattr(args, "stream_daily", False) and args.type == "forecast")
+    segment_hours = max(3, int(getattr(args, "segment_hours", 24)))
+    sorted_lts = sorted(leadtimes, key=lambda x: int(x)) if args.type == "forecast" else leadtimes
 
     all_levels = [str(l) for l in range(1, 138)]
 
@@ -647,7 +809,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         len(SURFACE_VARS),
         None,
         num_times,
-        leadtimes,
+        sorted_lts,
         max_fields=args.max_fields,
         explicit_lt_chunk=args.sfc_lt_chunk,
         explicit_level_chunks=1,
@@ -656,23 +818,26 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         len(UPPER_AIR_VARS),
         all_levels,
         num_times,
-        leadtimes,
+        sorted_lts,
         max_fields=args.max_fields,
-        explicit_lt_chunk=args.met_lt_chunk,
+        explicit_lt_chunk=None if stream_daily else args.met_lt_chunk,
         explicit_level_chunks=args.level_chunks,
     )
     chem_lvl_chunks, chem_lt_chunks, chem_f_per_lt, chem_max_lt = compute_stream_chunking(
         len(CHEM_VARS),
         all_levels,
         num_times,
-        leadtimes,
+        sorted_lts,
         max_fields=args.max_fields,
-        explicit_lt_chunk=args.chem_lt_chunk,
+        explicit_lt_chunk=None if stream_daily else args.chem_lt_chunk,
         explicit_level_chunks=args.level_chunks,
     )
 
+    horizons_def = _build_horizon_buckets(sorted_lts, segment_hours) if stream_daily else []
     plan_lines = [
-        f"Chunking Plan (format={args.format}, max_fields={args.max_fields}, total_leadtimes={len(leadtimes)}):",
+        f"Chunking Plan (format={args.format}, max_fields={args.max_fields}, total_leadtimes={len(sorted_lts)}, "
+        f"stream_daily={stream_daily}"
+        + (f", buckets={len(horizons_def)}x{segment_hours}h):" if stream_daily else "):"),
         f"  - Regional Area: {getattr(args, 'area', 'global')}",
         f"  - Surface (2D): {len(SURFACE_VARS)} vars x 1 lvl = {sfc_f_per_lt} fields/lt "
         f"(max {sfc_max_lt} lts/req) -> {len(sfc_lt_chunks)} request(s), "
@@ -690,9 +855,9 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
             len(GHG_VARS),
             all_levels,
             1,
-            leadtimes,
+            sorted_lts,
             max_fields=args.max_fields,
-            explicit_lt_chunk=args.ghg_lt_chunk,
+            explicit_lt_chunk=None if stream_daily else args.ghg_lt_chunk,
             explicit_level_chunks=args.level_chunks,
         )
         plan_lines.append(
@@ -713,7 +878,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         date_dash = date.strftime("%Y-%m-%d")
 
         if args.type == "forecast" and not getattr(args, "no_split_days", False):
-            max_lt = max(int(lt) for lt in leadtimes)
+            max_lt = max(int(lt) for lt in sorted_lts)
             expected_days = [(date + pd.Timedelta(hours=h)).strftime("%Y%m%d") for h in range(0, max_lt + 1, 24)]
         else:
             expected_days = [date_str]
@@ -735,6 +900,13 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
 
         if not (need_sfc or need_ml or need_ghg):
             log_msg(f"Skipping {date_str}, final merged daily NetCDF files already exist.")
+            if stream_daily:
+                os.makedirs(args.data_root_folder, exist_ok=True)
+                for bound_h, _ in horizons_def:
+                    rmarker = os.path.join(args.data_root_folder, f".cams_ready_{date_str}_h{bound_h:03d}.done")
+                    if not os.path.exists(rmarker):
+                        with open(rmarker, "w", encoding="utf-8") as mf:
+                            mf.write("DONE\n")
             continue
 
         temp_raw_dir = os.path.join(args.data_root_folder, f"tmp_gribs_{date_str}")
@@ -752,183 +924,251 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
             "met_nc_by_lvl": [[] for _ in range(len(met_lvl_chunks))] if need_ml else [],
             "chem_nc_by_lvl": [[] for _ in range(len(chem_lvl_chunks))] if need_ml else [],
             "ghg_nc_by_lvl": [[] for _ in range(len(ghg_lvl_chunks))] if need_ghg else [],
+            "horizons": [],
         }
         date_specs[date_str] = date_spec
 
-        # 1. Surface Tasks
-        if need_sfc:
-            for c_idx, lt_chunk in enumerate(sfc_lt_chunks):
-                base_name = "cams_sfc_all" if len(sfc_lt_chunks) == 1 else f"cams_sfc_chunk_{c_idx}"
-                raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
-                nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
-                marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
-                lt_param = lt_chunk if args.type == "forecast" else "0"
-                num_fields = len(SURFACE_VARS) * len(lt_chunk) * num_times
+        if stream_daily:
+            cum_markers: list[str] = []
+            cum_met_by_lvl: list[list[str]] = [[] for _ in range(len(met_lvl_chunks))] if need_ml else []
+            cum_chem_by_lvl: list[list[str]] = [[] for _ in range(len(chem_lvl_chunks))] if need_ml else []
+            cum_ghg_by_lvl: list[list[str]] = [[] for _ in range(len(ghg_lvl_chunks))] if need_ghg else []
 
-                sfc_req: dict[str, Any] = {
-                    "variable": SURFACE_VARS,
-                    "date": f"{date_dash}/{date_dash}",
-                    "time": times,
-                    "data_format": args.format,
-                    "type": args.type,
-                    "leadtime_hour": lt_param,
-                }
-                if getattr(args, "area", None):
-                    sfc_req["area"] = [float(x) for x in args.area]
-                date_spec["all_markers"].append(marker_fp)
-                date_spec["sfc_nc_files"].append(nc_fp)
+            for b_idx, (bound_h, b_lts) in enumerate(horizons_def):
+                if b_idx == 0 and need_sfc:
+                    for c_idx, lt_chunk in enumerate(sfc_lt_chunks):
+                        base_name = "cams_sfc_all" if len(sfc_lt_chunks) == 1 else f"cams_sfc_chunk_{c_idx}"
+                        task, marker_fp, nc_fp = _make_sfc_task(
+                            date_str=date_str,
+                            date_dash=date_dash,
+                            base_name=base_name,
+                            lt_chunk=lt_chunk,
+                            times=times,
+                            args=args,
+                            date_spec=date_spec,
+                            temp_raw_dir=temp_raw_dir,
+                            temp_extract_dir=temp_extract_dir,
+                            ac_collection=ac_collection,
+                        )
+                        date_spec["all_markers"].append(marker_fp)
+                        date_spec["sfc_nc_files"].append(nc_fp)
+                        cum_markers.append(marker_fp)
+                        tasks.append(task)
 
-                tasks.append(
+                if need_ml:
+                    b_met_lvls, b_met_lts, _, _ = compute_stream_chunking(
+                        len(UPPER_AIR_VARS),
+                        all_levels,
+                        num_times,
+                        b_lts,
+                        max_fields=args.max_fields,
+                        explicit_lt_chunk=None,
+                        explicit_level_chunks=args.level_chunks,
+                    )
+                    for l_idx, lvl_chunk in enumerate(b_met_lvls):
+                        for lt_chunk in b_met_lts:
+                            lvl_suffix = "" if len(b_met_lvls) == 1 else f"_part{l_idx}"
+                            base_name = f"cams_met_h{int(lt_chunk[0]):03d}_{int(lt_chunk[-1]):03d}{lvl_suffix}"
+                            task, marker_fp, nc_fp = _make_3d_task(
+                                collection=ac_collection,
+                                variables=UPPER_AIR_VARS,
+                                date_str=date_str,
+                                date_dash=date_dash,
+                                base_name=base_name,
+                                lvl_chunk=lvl_chunk,
+                                lt_chunk=lt_chunk,
+                                times=times,
+                                include_type=True,
+                                args=args,
+                                date_spec=date_spec,
+                                temp_raw_dir=temp_raw_dir,
+                                temp_extract_dir=temp_extract_dir,
+                            )
+                            date_spec["all_markers"].append(marker_fp)
+                            date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
+                            cum_markers.append(marker_fp)
+                            cum_met_by_lvl[l_idx].append(nc_fp)
+                            tasks.append(task)
+
+                    b_chem_lvls, b_chem_lts, _, _ = compute_stream_chunking(
+                        len(CHEM_VARS),
+                        all_levels,
+                        num_times,
+                        b_lts,
+                        max_fields=args.max_fields,
+                        explicit_lt_chunk=None,
+                        explicit_level_chunks=args.level_chunks,
+                    )
+                    for l_idx, lvl_chunk in enumerate(b_chem_lvls):
+                        for lt_chunk in b_chem_lts:
+                            lvl_suffix = "" if len(b_chem_lvls) == 1 else f"_part{l_idx}"
+                            if len(lt_chunk) == 1:
+                                base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
+                            else:
+                                base_name = f"cams_chem_h{int(lt_chunk[0]):03d}_{int(lt_chunk[-1]):03d}{lvl_suffix}"
+                            task, marker_fp, nc_fp = _make_3d_task(
+                                collection=ac_collection,
+                                variables=CHEM_VARS,
+                                date_str=date_str,
+                                date_dash=date_dash,
+                                base_name=base_name,
+                                lvl_chunk=lvl_chunk,
+                                lt_chunk=lt_chunk,
+                                times=times,
+                                include_type=True,
+                                args=args,
+                                date_spec=date_spec,
+                                temp_raw_dir=temp_raw_dir,
+                                temp_extract_dir=temp_extract_dir,
+                            )
+                            date_spec["all_markers"].append(marker_fp)
+                            date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
+                            cum_markers.append(marker_fp)
+                            cum_chem_by_lvl[l_idx].append(nc_fp)
+                            tasks.append(task)
+
+                if need_ghg:
+                    b_ghg_lvls, b_ghg_lts, _, _ = compute_stream_chunking(
+                        len(GHG_VARS),
+                        all_levels,
+                        1,
+                        b_lts,
+                        max_fields=args.max_fields,
+                        explicit_lt_chunk=None,
+                        explicit_level_chunks=args.level_chunks,
+                    )
+                    for l_idx, lvl_chunk in enumerate(b_ghg_lvls):
+                        for lt_chunk in b_ghg_lts:
+                            lvl_suffix = "" if len(b_ghg_lvls) == 1 else f"_part{l_idx}"
+                            base_name = f"cams_ghg_h{int(lt_chunk[0]):03d}_{int(lt_chunk[-1]):03d}{lvl_suffix}"
+                            task, marker_fp, nc_fp = _make_3d_task(
+                                collection=ghg_collection,
+                                variables=GHG_VARS,
+                                date_str=date_str,
+                                date_dash=date_dash,
+                                base_name=base_name,
+                                lvl_chunk=lvl_chunk,
+                                lt_chunk=lt_chunk,
+                                times=None,
+                                include_type=False,
+                                args=args,
+                                date_spec=date_spec,
+                                temp_raw_dir=temp_raw_dir,
+                                temp_extract_dir=temp_extract_dir,
+                            )
+                            date_spec["all_markers"].append(marker_fp)
+                            date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
+                            cum_markers.append(marker_fp)
+                            cum_ghg_by_lvl[l_idx].append(nc_fp)
+                            tasks.append(task)
+
+                date_spec["horizons"].append(
                     {
-                        "name": f"{date_str}:{base_name}",
-                        "collection": ac_collection,
-                        "date_str": date_str,
-                        "date_spec": date_spec,
-                        "temp_raw_dir": temp_raw_dir,
-                        "temp_extract_dir": temp_extract_dir,
-                        "request": sfc_req,
-                        "output_raw": raw_fp,
-                        "output_nc": nc_fp,
-                        "marker": marker_fp,
-                        "format": args.format,
-                        "is_3d": False,
-                        "num_fields": num_fields,
-                        "lt_chunk": lt_chunk,
+                        "horizon_h": bound_h,
+                        "ready_marker": os.path.join(args.data_root_folder, f".cams_ready_{date_str}_h{bound_h:03d}.done"),
+                        "required_markers": list(cum_markers),
+                        "sfc_nc_files": list(date_spec["sfc_nc_files"]),
+                        "met_nc_by_lvl": [list(g) for g in cum_met_by_lvl],
+                        "chem_nc_by_lvl": [list(g) for g in cum_chem_by_lvl],
+                        "ghg_nc_by_lvl": [list(g) for g in cum_ghg_by_lvl],
                     }
                 )
-
-        # 2. 3D Met & Chem Tasks
-        if need_ml:
-            for l_idx, lvl_chunk in enumerate(met_lvl_chunks):
-                for c_idx, lt_chunk in enumerate(met_lt_chunks):
-                    lvl_suffix = "" if len(met_lvl_chunks) == 1 else f"_part{l_idx}"
-                    base_name = f"cams_met_chunk_{c_idx}{lvl_suffix}"
-                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
-                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
-                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
-                    lt_param = lt_chunk if args.type == "forecast" else "0"
-                    num_fields = len(UPPER_AIR_VARS) * len(lvl_chunk) * len(lt_chunk) * num_times
-
-                    met_req: dict[str, Any] = {
-                        "variable": UPPER_AIR_VARS,
-                        "model_level": lvl_chunk,
-                        "date": f"{date_dash}/{date_dash}",
-                        "time": times,
-                        "data_format": args.format,
-                        "type": args.type,
-                        "leadtime_hour": lt_param,
-                    }
-                    if getattr(args, "area", None):
-                        met_req["area"] = [float(x) for x in args.area]
-                    date_spec["all_markers"].append(marker_fp)
-                    date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
-
-                    tasks.append(
-                        {
-                            "name": f"{date_str}:{base_name}",
-                            "collection": ac_collection,
-                            "date_str": date_str,
-                            "date_spec": date_spec,
-                            "temp_raw_dir": temp_raw_dir,
-                            "temp_extract_dir": temp_extract_dir,
-                            "request": met_req,
-                            "output_raw": raw_fp,
-                            "output_nc": nc_fp,
-                            "marker": marker_fp,
-                            "format": args.format,
-                            "is_3d": True,
-                            "num_fields": num_fields,
-                            "lt_chunk": lt_chunk,
-                        }
+        else:
+            # 1. Surface Tasks
+            if need_sfc:
+                for c_idx, lt_chunk in enumerate(sfc_lt_chunks):
+                    base_name = "cams_sfc_all" if len(sfc_lt_chunks) == 1 else f"cams_sfc_chunk_{c_idx}"
+                    task, marker_fp, nc_fp = _make_sfc_task(
+                        date_str=date_str,
+                        date_dash=date_dash,
+                        base_name=base_name,
+                        lt_chunk=lt_chunk,
+                        times=times,
+                        args=args,
+                        date_spec=date_spec,
+                        temp_raw_dir=temp_raw_dir,
+                        temp_extract_dir=temp_extract_dir,
+                        ac_collection=ac_collection,
                     )
-
-            for l_idx, lvl_chunk in enumerate(chem_lvl_chunks):
-                for c_idx, lt_chunk in enumerate(chem_lt_chunks):
-                    lvl_suffix = "" if len(chem_lvl_chunks) == 1 else f"_part{l_idx}"
-                    if len(lt_chunk) == 1:
-                        base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
-                    else:
-                        base_name = f"cams_chem_chunk_{c_idx}{lvl_suffix}"
-                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
-                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
-                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
-                    lt_param = lt_chunk if args.type == "forecast" else "0"
-                    num_fields = len(CHEM_VARS) * len(lvl_chunk) * len(lt_chunk) * num_times
-
-                    chem_req: dict[str, Any] = {
-                        "variable": CHEM_VARS,
-                        "model_level": lvl_chunk,
-                        "date": f"{date_dash}/{date_dash}",
-                        "time": times,
-                        "data_format": args.format,
-                        "type": args.type,
-                        "leadtime_hour": lt_param,
-                    }
-                    if getattr(args, "area", None):
-                        chem_req["area"] = [float(x) for x in args.area]
                     date_spec["all_markers"].append(marker_fp)
-                    date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
+                    date_spec["sfc_nc_files"].append(nc_fp)
+                    tasks.append(task)
 
-                    tasks.append(
-                        {
-                            "name": f"{date_str}:{base_name}",
-                            "collection": ac_collection,
-                            "date_str": date_str,
-                            "date_spec": date_spec,
-                            "temp_raw_dir": temp_raw_dir,
-                            "temp_extract_dir": temp_extract_dir,
-                            "request": chem_req,
-                            "output_raw": raw_fp,
-                            "output_nc": nc_fp,
-                            "marker": marker_fp,
-                            "format": args.format,
-                            "is_3d": True,
-                            "num_fields": num_fields,
-                            "lt_chunk": lt_chunk,
-                        }
-                    )
+            # 2. 3D Met & Chem Tasks
+            if need_ml:
+                for l_idx, lvl_chunk in enumerate(met_lvl_chunks):
+                    for c_idx, lt_chunk in enumerate(met_lt_chunks):
+                        lvl_suffix = "" if len(met_lvl_chunks) == 1 else f"_part{l_idx}"
+                        base_name = f"cams_met_chunk_{c_idx}{lvl_suffix}"
+                        task, marker_fp, nc_fp = _make_3d_task(
+                            collection=ac_collection,
+                            variables=UPPER_AIR_VARS,
+                            date_str=date_str,
+                            date_dash=date_dash,
+                            base_name=base_name,
+                            lvl_chunk=lvl_chunk,
+                            lt_chunk=lt_chunk,
+                            times=times,
+                            include_type=True,
+                            args=args,
+                            date_spec=date_spec,
+                            temp_raw_dir=temp_raw_dir,
+                            temp_extract_dir=temp_extract_dir,
+                        )
+                        date_spec["all_markers"].append(marker_fp)
+                        date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
+                        tasks.append(task)
 
-        # 3. 3D GHG Tasks (0.1 deg CO2 & CH4; forecast-only at 00:00 UTC)
-        if need_ghg:
-            for l_idx, lvl_chunk in enumerate(ghg_lvl_chunks):
-                for c_idx, lt_chunk in enumerate(ghg_lt_chunks):
-                    lvl_suffix = "" if len(ghg_lvl_chunks) == 1 else f"_part{l_idx}"
-                    base_name = f"cams_ghg_chunk_{c_idx}{lvl_suffix}"
-                    raw_fp = os.path.join(temp_raw_dir, f"{base_name}.{ext}")
-                    nc_fp = os.path.join(temp_extract_dir, f"{base_name}.nc")
-                    marker_fp = os.path.join(temp_raw_dir, f"{base_name}.done")
-                    num_fields = len(GHG_VARS) * len(lvl_chunk) * len(lt_chunk)
+                for l_idx, lvl_chunk in enumerate(chem_lvl_chunks):
+                    for c_idx, lt_chunk in enumerate(chem_lt_chunks):
+                        lvl_suffix = "" if len(chem_lvl_chunks) == 1 else f"_part{l_idx}"
+                        if len(lt_chunk) == 1:
+                            base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
+                        else:
+                            base_name = f"cams_chem_chunk_{c_idx}{lvl_suffix}"
+                        task, marker_fp, nc_fp = _make_3d_task(
+                            collection=ac_collection,
+                            variables=CHEM_VARS,
+                            date_str=date_str,
+                            date_dash=date_dash,
+                            base_name=base_name,
+                            lvl_chunk=lvl_chunk,
+                            lt_chunk=lt_chunk,
+                            times=times,
+                            include_type=True,
+                            args=args,
+                            date_spec=date_spec,
+                            temp_raw_dir=temp_raw_dir,
+                            temp_extract_dir=temp_extract_dir,
+                        )
+                        date_spec["all_markers"].append(marker_fp)
+                        date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
+                        tasks.append(task)
 
-                    ghg_req: dict[str, Any] = {
-                        "variable": GHG_VARS,
-                        "model_level": lvl_chunk,
-                        "date": f"{date_dash}/{date_dash}",
-                        "data_format": args.format,
-                        "leadtime_hour": lt_chunk,
-                    }
-                    if getattr(args, "area", None):
-                        ghg_req["area"] = [float(x) for x in args.area]
-                    date_spec["all_markers"].append(marker_fp)
-                    date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
-
-                    tasks.append(
-                        {
-                            "name": f"{date_str}:{base_name}",
-                            "collection": ghg_collection,
-                            "date_str": date_str,
-                            "date_spec": date_spec,
-                            "temp_raw_dir": temp_raw_dir,
-                            "temp_extract_dir": temp_extract_dir,
-                            "request": ghg_req,
-                            "output_raw": raw_fp,
-                            "output_nc": nc_fp,
-                            "marker": marker_fp,
-                            "format": args.format,
-                            "is_3d": True,
-                            "num_fields": num_fields,
-                            "lt_chunk": lt_chunk,
-                        }
-                    )
+            # 3. 3D GHG Tasks (0.1 deg CO2 & CH4; forecast-only at 00:00 UTC)
+            if need_ghg:
+                for l_idx, lvl_chunk in enumerate(ghg_lvl_chunks):
+                    for c_idx, lt_chunk in enumerate(ghg_lt_chunks):
+                        lvl_suffix = "" if len(ghg_lvl_chunks) == 1 else f"_part{l_idx}"
+                        base_name = f"cams_ghg_chunk_{c_idx}{lvl_suffix}"
+                        task, marker_fp, nc_fp = _make_3d_task(
+                            collection=ghg_collection,
+                            variables=GHG_VARS,
+                            date_str=date_str,
+                            date_dash=date_dash,
+                            base_name=base_name,
+                            lvl_chunk=lvl_chunk,
+                            lt_chunk=lt_chunk,
+                            times=None,
+                            include_type=False,
+                            args=args,
+                            date_spec=date_spec,
+                            temp_raw_dir=temp_raw_dir,
+                            temp_extract_dir=temp_extract_dir,
+                        )
+                        date_spec["all_markers"].append(marker_fp)
+                        date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
+                        tasks.append(task)
 
     return tasks
 
@@ -945,7 +1185,14 @@ def is_http_400_error(exc: Exception) -> bool:
     return False
 
 
-def _merge_and_save_3d_groups(stream: str, nc_by_lvl_groups, date_str: str, args: argparse.Namespace) -> None:
+def _merge_and_save_3d_groups(
+    stream: str,
+    nc_by_lvl_groups,
+    date_str: str,
+    args: argparse.Namespace,
+    *,
+    skip_if_steps_ge: bool = False,
+) -> None:
     opened = []
     lvl_merged_datasets = []
     try:
@@ -980,13 +1227,102 @@ def _merge_and_save_3d_groups(stream: str, nc_by_lvl_groups, date_str: str, args
             date_str,
             args.data_root_folder,
             no_split_days=getattr(args, "no_split_days", False),
+            skip_if_steps_ge=skip_if_steps_ge,
         )
     finally:
         for ds in opened:
             ds.close()
 
 
-def check_and_merge(date_spec: dict, args: argparse.Namespace) -> None:
+def _flush_date_spec(
+    *,
+    date_str: str,
+    need_sfc: bool,
+    need_ml: bool,
+    need_ghg: bool,
+    sfc_files: list[str],
+    met_nc_by_lvl: list[list[str]],
+    chem_nc_by_lvl: list[list[str]],
+    ghg_nc_by_lvl: list[list[str]],
+    args: argparse.Namespace,
+    skip_if_steps_ge: bool = False,
+) -> None:
+    if need_sfc and sfc_files:
+        opened_sfc = [xr.open_dataset(f, chunks={"forecast_period": 1}) for f in sfc_files]
+        try:
+            ds_sfc = (
+                opened_sfc[0]
+                if len(opened_sfc) == 1
+                else xr.concat(opened_sfc, dim="forecast_period").sortby("forecast_period")
+            )
+            save_dataset_daily_and_base(
+                ds_sfc,
+                "sfc",
+                date_str,
+                args.data_root_folder,
+                no_split_days=getattr(args, "no_split_days", False),
+                skip_if_steps_ge=skip_if_steps_ge,
+            )
+        finally:
+            for ds in opened_sfc:
+                ds.close()
+
+    if need_ml and met_nc_by_lvl and chem_nc_by_lvl:
+        _merge_and_save_3d_groups(
+            "ml",
+            [met_nc_by_lvl, chem_nc_by_lvl],
+            date_str,
+            args,
+            skip_if_steps_ge=skip_if_steps_ge,
+        )
+
+    if need_ghg and ghg_nc_by_lvl:
+        _merge_and_save_3d_groups(
+            "ghg",
+            [ghg_nc_by_lvl],
+            date_str,
+            args,
+            skip_if_steps_ge=skip_if_steps_ge,
+        )
+
+
+def check_and_flush_horizons(date_spec: dict, args: argparse.Namespace) -> None:
+    """Incrementally flush cumulative daily NetCDFs whenever a horizon bucket finishes."""
+    horizons = date_spec.get("horizons")
+    if not horizons:
+        return
+    date_str = date_spec["date_str"]
+    with _MERGE_LOCK:
+        for h_spec in horizons:
+            ready_marker = h_spec["ready_marker"]
+            if os.path.exists(ready_marker):
+                continue
+            if not all(os.path.exists(m) for m in h_spec["required_markers"]):
+                break
+            t_start = time.time()
+            _flush_date_spec(
+                date_str=date_str,
+                need_sfc=bool(date_spec.get("need_sfc")),
+                need_ml=bool(date_spec.get("need_ml")),
+                need_ghg=bool(date_spec.get("need_ghg")),
+                sfc_files=h_spec["sfc_nc_files"],
+                met_nc_by_lvl=h_spec["met_nc_by_lvl"],
+                chem_nc_by_lvl=h_spec["chem_nc_by_lvl"],
+                ghg_nc_by_lvl=h_spec["ghg_nc_by_lvl"],
+                args=args,
+                skip_if_steps_ge=True,
+            )
+            tmp_marker = f"{ready_marker}.tmp.{os.getpid()}"
+            with open(tmp_marker, "w", encoding="utf-8") as f:
+                f.write("DONE\n")
+            os.replace(tmp_marker, ready_marker)
+            log_msg(
+                f"[STREAM-READY] {date_str}: horizon 0..{h_spec['horizon_h']}h ready "
+                f"in {time.time() - t_start:.1f}s ({os.path.basename(ready_marker)})"
+            )
+
+
+def check_and_merge(date_spec: dict, args: argparse.Namespace, *, skip_if_steps_ge: bool = False) -> None:
     date_str = date_spec["date_str"]
     temp_raw_dir = date_spec["temp_raw_dir"]
     temp_extract_dir = date_spec["temp_extract_dir"]
@@ -1004,33 +1340,18 @@ def check_and_merge(date_spec: dict, args: argparse.Namespace) -> None:
     t_merge_start = time.time()
     try:
         log_msg(f"[MERGE-START] All {len(date_spec['all_markers'])} chunks for {date_str} are complete. Merging...")
-
-        if date_spec.get("need_sfc") and date_spec.get("sfc_nc_files"):
-            sfc_files = date_spec["sfc_nc_files"]
-            opened_sfc = [xr.open_dataset(f, chunks={"forecast_period": 1}) for f in sfc_files]
-            try:
-                if len(opened_sfc) == 1:
-                    ds_sfc = opened_sfc[0]
-                else:
-                    ds_sfc = xr.concat(opened_sfc, dim="forecast_period").sortby("forecast_period")
-
-                save_dataset_daily_and_base(
-                    ds_sfc,
-                    "sfc",
-                    date_str,
-                    args.data_root_folder,
-                    no_split_days=getattr(args, "no_split_days", False),
-                )
-            finally:
-                for ds in opened_sfc:
-                    ds.close()
-
-        if date_spec.get("need_ml"):
-            _merge_and_save_3d_groups("ml", [date_spec["met_nc_by_lvl"], date_spec["chem_nc_by_lvl"]], date_str, args)
-
-        if date_spec.get("need_ghg") and date_spec.get("ghg_nc_by_lvl"):
-            _merge_and_save_3d_groups("ghg", [date_spec["ghg_nc_by_lvl"]], date_str, args)
-
+        _flush_date_spec(
+            date_str=date_str,
+            need_sfc=bool(date_spec.get("need_sfc")),
+            need_ml=bool(date_spec.get("need_ml")),
+            need_ghg=bool(date_spec.get("need_ghg")),
+            sfc_files=date_spec.get("sfc_nc_files", []),
+            met_nc_by_lvl=date_spec.get("met_nc_by_lvl", []),
+            chem_nc_by_lvl=date_spec.get("chem_nc_by_lvl", []),
+            ghg_nc_by_lvl=date_spec.get("ghg_nc_by_lvl", []),
+            args=args,
+            skip_if_steps_ge=skip_if_steps_ge,
+        )
         log_msg(
             f"[MERGE-DONE] Full merge and daily slicing for {date_str} completed in {time.time() - t_merge_start:.1f}s."
         )
@@ -1104,6 +1425,29 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                     pass
 
         if need_download:
+            is_ghg_task = task.get("collection") == "cams-global-greenhouse-gas-forecasts"
+            ghg_poll_deadline_utc = None
+            if is_ghg_task:
+                try:
+                    ghg_init_utc = dt.datetime.strptime(task["date_str"], "%Y%m%d").replace(tzinfo=dt.timezone.utc)
+                    ghg_delay_h = float(os.environ.get("CAMS_GHG_PUBLISH_DELAY_HOURS", "13.5"))
+                    ghg_ready_utc = ghg_init_utc + dt.timedelta(hours=ghg_delay_h)
+                    ghg_poll_deadline_utc = ghg_init_utc + dt.timedelta(hours=18.0)
+                    now_utc = dt.datetime.now(dt.timezone.utc)
+                    if now_utc < ghg_ready_utc:
+                        wait_sec = (ghg_ready_utc - now_utc).total_seconds()
+                        log_msg(
+                            f"[GHG-WAIT] {task['name']} | Waiting {wait_sec / 60.0:.1f}m until expected ADS GHG "
+                            f"publication window ({ghg_ready_utc:%Y-%m-%d %H:%M} UTC)..."
+                        )
+                        while True:
+                            rem = (ghg_ready_utc - dt.datetime.now(dt.timezone.utc)).total_seconds()
+                            if rem <= 0:
+                                break
+                            time.sleep(min(300.0, rem))
+                except ValueError:
+                    ghg_poll_deadline_utc = None
+
             log_msg(
                 f"[SUBMITTED] {task['name']} | format={task['format']} | fields={task['num_fields']} | "
                 f"leadtimes={lt_desc} -> {os.path.basename(task['output_raw'])}"
@@ -1112,7 +1456,8 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
             max_retries = max(0, int(getattr(args, "max_retries", 3)))
             c = client or get_thread_cds_client()
 
-            for attempt in range(max_retries + 1):
+            attempt = 0
+            while True:
                 t_req_start = time.time()
                 try:
                     c.retrieve(
@@ -1135,6 +1480,18 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                             pass
 
                     if is_http_400_error(e):
+                        if (
+                            is_ghg_task
+                            and ghg_poll_deadline_utc is not None
+                            and dt.datetime.now(dt.timezone.utc) < ghg_poll_deadline_utc
+                        ):
+                            log_msg(
+                                f"[GHG-WAIT] {task['name']} | ADS GHG not yet published in catalogue "
+                                f"(HTTP 400); polling again in 600s..."
+                            )
+                            time.sleep(600)
+                            c = reset_thread_cds_client()
+                            continue
                         log_msg(f"[FAILED-FAST] {task['name']} | Non-retryable HTTP 400 Bad Request: {e}")
                         raise
 
@@ -1145,6 +1502,7 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                             f"Transient error: {e} | Waiting {backoff_s}s before retry..."
                         )
                         time.sleep(backoff_s)
+                        attempt += 1
                         c = reset_thread_cds_client()
                     else:
                         log_msg(f"[FAILED] {task['name']} | Exhausted {max_retries} retries. Last error: {e}")
@@ -1205,6 +1563,8 @@ def execute_cams_pipeline(args: argparse.Namespace) -> list[dict]:
             task = future_to_task[future]
             try:
                 future.result()
+                if getattr(args, "stream_daily", False):
+                    check_and_flush_horizons(task["date_spec"], args)
             except Exception as exc:
                 failures.append((task["name"], exc))
                 log_msg(f"[TASK-ERROR] {task['name']} raised exception: {exc}")
@@ -1220,7 +1580,11 @@ def execute_cams_pipeline(args: argparse.Namespace) -> list[dict]:
         d_str = task["date_str"]
         if d_str not in seen_dates:
             seen_dates.add(d_str)
-            check_and_merge(task["date_spec"], args)
+            check_and_merge(
+                task["date_spec"],
+                args,
+                skip_if_steps_ge=bool(getattr(args, "stream_daily", False)),
+            )
 
     total_wall = time.time() - t_all_start
     log_msg(
@@ -1255,6 +1619,8 @@ def download_cams_forecast(
     area: Sequence[float] | None = None,
     leadtimes: Sequence[str | int] | str | None = None,
     no_split_days: bool = False,
+    stream_daily: bool | None = None,
+    segment_hours: int | None = 24,
 ) -> list[dict]:
     """Programmatic entry point matching the CAMS GRIB pipelined downloader CLI."""
     if leadtimes is not None:
@@ -1291,6 +1657,8 @@ def download_cams_forecast(
         area=list(area) if area is not None else None,
         leadtimes=norm_lts,
         no_split_days=bool(no_split_days),
+        stream_daily=stream_daily,
+        segment_hours=segment_hours,
     )
     apply_config_and_defaults(ns)
     return execute_cams_pipeline(ns)

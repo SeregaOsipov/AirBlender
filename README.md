@@ -117,7 +117,7 @@ airblender cams2wps --sfc ECMWF-CAMS_sfc_20261114.nc --ml ECMWF-CAMS_ml_20261114
 airblender wrf2palm --config palm_doha_100m.yaml --date 2026-11-14 --mode phstatp-salsa
 
 # 6. Optional Donor Data Acquisition (`airblender[fetch]`)
-airblender fetch-cams --start_date 2026-11-14 --end_date 2026-11-14 --data_root_folder /path/to/CAMS --type forecast --time 00:00 --ghg
+airblender fetch-cams --start_date 2026-11-14 --end_date 2026-11-14 --data_root_folder /path/to/CAMS --type forecast --time 00:00 --ghg --stream_daily --segment_hours 24
 airblender fetch-eac4 --start_date 2026-03-01 --end_date 2026-03-05 --data_root_folder /path/to/EAC4
 airblender fetch-ifs --start_date 2026-03-01 --end_date 2026-03-02 --data_root_folder /path/to/IFS --grid F1280 --retrieve_ml true
 airblender fetch-opendata --mode sol --date 2026-11-14 --outdir /path/to/HRES
@@ -144,6 +144,8 @@ download_cams_forecast(
     cams_type="forecast",
     cams_time="00:00",
     ghg=True,
+    stream_daily=True,
+    segment_hours=24,
 )
 download_opendata_soil(date="2026-11-14", out_dir="/path/to/HRES")
 download_merra2(start_date="2026-11-14", ndays=2, out_dir="/path/to/MERRA2", preset="wrfchem")
