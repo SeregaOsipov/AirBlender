@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airblender"
-version = "0.3.0"
-description = "Unified atmospheric meteorology, chemistry, and aerosol coupler (CAMS/MERRA-2/EMAC -> WPS/WRF-Chem -> PALM-4U)"
+version = "0.4.0"
+description = "Unified atmospheric meteorology, chemistry, and aerosol coupler (CAMS/IFS/MERRA-2/EMAC -> WPS/WRF-Chem/ICON-ART -> PALM-4U)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -37,6 +37,7 @@ cams2wrf = "airblender.cli:main_cams2wrf"
 merra2wrf = "airblender.cli:main_merra2wrf"
 emac2wrf = "airblender.cli:main_emac2wrf"
 cams2wps = "airblender.cli:main_cams2wps"
+cams2icon = "airblender.cli:main_cams2icon"
 wrf2palm = "airblender.cli:main_wrf2palm"
 
 [tool.setuptools.packages.find]

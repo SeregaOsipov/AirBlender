@@ -687,6 +687,297 @@ def test_cams_stream_daily() -> None:
     print("  -> Test 5 PASSED.")
 
 
+def test_dynamics_resolver_and_fallback() -> None:
+    print("[Test 6] DynamicsResolver auto-fallback, pinned error, env override, and provenance...")
+    import json
+    import os
+    from unittest.mock import patch
+    from airblender.fetch.dynamics import resolve_and_fetch_dynamics
+
+    with tempfile.TemporaryDirectory(prefix="airblender_dyn_") as td:
+        root = Path(td)
+        cams_dir = root / "cams"
+        ifs_dir = root / "ifs"
+        prov_dir = root / "prov"
+        cams_dir.mkdir()
+
+        # 6a. MARS blocked (RESTRICTED_ACCESS_TO_VALID_DATA) -> falls back to S3 0.1°
+        with (
+            patch("airblender.fetch.dynamics.probe_ifs_mars_access", return_value=(False, "MARS_RESTRICTED_ACCESS_TO_VALID_DATA")),
+            patch("airblender.fetch.dynamics.probe_opendata_0p1", return_value=(True, "ok")),
+            patch("airblender.fetch.dynamics.download_opendata_0p1_sfc_daily", return_value=[]) as mock_od_dl,
+        ):
+            res = resolve_and_fetch_dynamics(
+                "2026-11-22",
+                cams_dir=cams_dir,
+                out_dir=ifs_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km", "fallback_chain": ["ifs_0p1_sfc_cams_ml", "cams_0p4_ml"]},
+                leadtimes_hours=[0, 3],
+                provenance_dir=prov_dir,
+            )
+            assert res.provider == "ifs_0p1_sfc_cams_ml"
+            assert res.sfc_res_deg == 0.1 and res.ml_res_deg == 0.4
+            assert "ifs_mars_9km" in res.fallback_reasons
+            mock_od_dl.assert_called_once()
+            prov = json.loads((prov_dir / "dynamics_provenance.json").read_text(encoding="utf-8"))
+            assert prov["provider"] == "ifs_0p1_sfc_cams_ml"
+
+        # 6b. Both MARS and S3 fail -> clean fallback to cams_0p4_ml
+        with (
+            patch("airblender.fetch.dynamics.probe_ifs_mars_access", return_value=(False, "401 Unauthorized")),
+            patch("airblender.fetch.dynamics.probe_opendata_0p1", return_value=(False, "TimeoutError")),
+        ):
+            res2 = resolve_and_fetch_dynamics(
+                "2026-11-22",
+                cams_dir=cams_dir,
+                out_dir=ifs_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km"},
+                leadtimes_hours=[0, 3],
+            )
+            assert res2.provider == "cams_0p4_ml"
+            assert res2.met_sfc_dir == cams_dir and res2.met_sfc_prefix == "ECMWF-CAMS_sfc"
+
+        # 6c. Pinned mode raises when primary unavailable
+        with patch("airblender.fetch.dynamics.probe_ifs_mars_access", return_value=(False, "403 Expired")):
+            try:
+                resolve_and_fetch_dynamics(
+                    "2026-11-22",
+                    cams_dir=cams_dir,
+                    out_dir=ifs_dir,
+                    dynamics_cfg={"mode": "pinned", "primary": "ifs_mars_9km"},
+                    leadtimes_hours=[0, 3],
+                )
+                raise AssertionError("Expected pinned mode to raise RuntimeError")
+            except RuntimeError:
+                pass
+
+        # 6d. Archive date succeeds on MARS 9km
+        with (
+            patch("airblender.fetch.dynamics.probe_ifs_mars_access", return_value=(True, "ok")),
+            patch("airblender.fetch.dynamics.download_ifs_forecast_mars", return_value={"sfc": [], "ml": []}) as mock_mars_dl,
+        ):
+            res3 = resolve_and_fetch_dynamics(
+                "2026-11-19",
+                cams_dir=cams_dir,
+                out_dir=ifs_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km"},
+                leadtimes_hours=[0, 3],
+            )
+            assert res3.provider == "ifs_mars_9km"
+            assert res3.met_sfc_prefix == "ECMWF-IFS_sfc" and res3.met_ml_prefix == "ECMWF-IFS_ml"
+            assert res3.ml_res_deg == 0.08
+            mock_mars_dl.assert_called_once()
+
+        # 6e. DYNAMICS_PROVIDER env override skips probes
+        saved = os.environ.get("DYNAMICS_PROVIDER")
+        try:
+            os.environ["DYNAMICS_PROVIDER"] = "cams_0p4_ml"
+            res4 = resolve_and_fetch_dynamics(
+                "2026-11-22",
+                cams_dir=cams_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km"},
+            )
+            assert res4.provider == "cams_0p4_ml"
+        finally:
+            if saved is None:
+                os.environ.pop("DYNAMICS_PROVIDER", None)
+            else:
+                os.environ["DYNAMICS_PROVIDER"] = saved
+
+        # 6f. Bounded MARS probe timeout + OpenData multi-mirror 503 failover
+        import io
+        import sys
+        import time as _t
+        import types
+        import urllib.error
+        from unittest.mock import MagicMock
+        from airblender.fetch.ecmwf_ifs import probe_ifs_mars_access
+        from airblender.fetch.opendata import S3_OPENDATA_BASE_URL, probe_opendata_0p1
+
+        fake_ecmwfapi = types.ModuleType("ecmwfapi")
+        class _SlowMars:
+            def __init__(self, *_args, **_kwargs):
+                pass
+            def execute(self, _req, _target):
+                _t.sleep(0.5)
+        fake_ecmwfapi.ECMWFService = _SlowMars
+        old_ecmwfapi = sys.modules.get("ecmwfapi")
+        sys.modules["ecmwfapi"] = fake_ecmwfapi
+        try:
+            with patch.dict(os.environ, {"ECMWF_API_KEY": "k", "ECMWF_API_EMAIL": "e@example.com"}):
+                t0 = _t.monotonic()
+                ok_to, reason_to = probe_ifs_mars_access("2026-11-19", max_step_h=0, timeout_sec=0.1)
+                elapsed = _t.monotonic() - t0
+                assert not ok_to, f"Expected timeout failure, got {(ok_to, reason_to)}"
+                assert "timed out" in reason_to.lower(), reason_to
+                assert elapsed < 0.4, f"Timeout took too long: {elapsed:.2f}s"
+        finally:
+            if old_ecmwfapi is None:
+                sys.modules.pop("ecmwfapi", None)
+            else:
+                sys.modules["ecmwfapi"] = old_ecmwfapi
+
+        calls_urls: list[str] = []
+        def _fake_urlopen(req, timeout=10.0):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            calls_urls.append(url)
+            if len(calls_urls) == 1:
+                raise urllib.error.HTTPError(url, 503, "Service Unavailable", hdrs=None, fp=io.BytesIO(b""))
+            resp = MagicMock()
+            resp.read.return_value = b'{"param": "2t", "_offset": 0, "_length": 100}\n'
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            ok_mir, reason_mir = probe_opendata_0p1("2026-11-22", max_step_h=0, s3_base_url=S3_OPENDATA_BASE_URL)
+            assert ok_mir, f"Expected mirror failover success, got: {reason_mir}"
+            assert len(calls_urls) == 2
+            assert calls_urls[0].split("/20261122")[0] != calls_urls[1].split("/20261122")[0]
+    print("  -> Test 6 PASSED.")
+
+
+def test_mixed_grid_wps_and_cams2icon() -> None:
+    print("[Test 7] Multi-grid convert_cams_to_wps (0.1° SFC + 0.4° ML) & airblender.cli cams2icon...")
+    from datetime import timezone
+    from airblender.cli import main as airblender_main
+    from airblender.fetch.opendata import _write_cdm_sfc_daily
+    from airblender.icon_icbc import prepare_icon_edgar_emissions, prepare_icon_ic, prepare_icon_latbc
+
+    with tempfile.TemporaryDirectory(prefix="airblender_mix_") as td:
+        root = Path(td)
+        cams_dir = root / "cams"
+        ifs_dir = root / "ifs"
+        wps_dir = root / "wps"
+        icon_run = root / "icon_run"
+        cams_dir.mkdir()
+        ifs_dir.mkdir()
+
+        # Build 0.1° SFC/Soil dataset in ifs_dir
+        lats_01 = np.linspace(27.0, 24.0, 31)
+        lons_01 = np.linspace(49.0, 53.0, 41)
+        lat2d_01, lon2d_01 = np.meshgrid(lats_01, lons_01, indexing="ij")
+        lsm_01 = np.where((lon2d_01 >= 50.8) & (lon2d_01 <= 51.6) & (lat2d_01 >= 24.5) & (lat2d_01 <= 26.2), 1.0, 0.0).astype(np.float32)
+
+        def _make_step_dict(temp_k: float) -> dict[str, xr.DataArray]:
+            coords = {"latitude": lats_01, "longitude": lons_01}
+            base = np.ones((len(lats_01), len(lons_01)), dtype=np.float32)
+            out = {
+                "sp": xr.DataArray(base * 101200.0, dims=("latitude", "longitude"), coords=coords),
+                "msl": xr.DataArray(base * 101300.0, dims=("latitude", "longitude"), coords=coords),
+                "z": xr.DataArray(lsm_01 * 150.0, dims=("latitude", "longitude"), coords=coords),
+                "lsm": xr.DataArray(lsm_01, dims=("latitude", "longitude"), coords=coords),
+                "skt": xr.DataArray(np.where(lsm_01 > 0.5, temp_k - 3.0, temp_k + 2.0).astype(np.float32), dims=("latitude", "longitude"), coords=coords),
+                "sst": xr.DataArray(np.where(lsm_01 < 0.5, temp_k + 2.0, np.nan).astype(np.float32), dims=("latitude", "longitude"), coords=coords),
+                "t2m": xr.DataArray(base * temp_k, dims=("latitude", "longitude"), coords=coords),
+                "d2m": xr.DataArray(base * (temp_k - 8.0), dims=("latitude", "longitude"), coords=coords),
+                "u10": xr.DataArray(base * 3.5, dims=("latitude", "longitude"), coords=coords),
+                "v10": xr.DataArray(base * -2.0, dims=("latitude", "longitude"), coords=coords),
+                "sd": xr.DataArray(base * 0.0, dims=("latitude", "longitude"), coords=coords),
+                "siconc": xr.DataArray(base * 0.0, dims=("latitude", "longitude"), coords=coords),
+            }
+            for i in range(1, 5):
+                out[f"stl{i}"] = xr.DataArray((base * (temp_k - i)).astype(np.float32), dims=("latitude", "longitude"), coords=coords)
+                out[f"swvl{i}"] = xr.DataArray(np.where(lsm_01 > 0.5, 0.14, 0.0).astype(np.float32), dims=("latitude", "longitude"), coords=coords)
+            return out
+
+        cycle_dt = datetime(2026, 11, 22, 0, 0, tzinfo=timezone.utc)
+        sfc_01_fp = ifs_dir / "ECMWF-IFS-0p1_sfc_20261122.nc"
+        _write_cdm_sfc_daily(sfc_01_fp, cycle_dt, [0, 3], [_make_step_dict(298.0), _make_step_dict(300.0)])
+
+        # Build 0.4° CAMS ML dataset (3 levels) + 0.1° GHG dataset
+        lats_04 = np.linspace(27.6, 23.6, 11)
+        lons_04 = np.linspace(48.8, 53.2, 12)
+        pv = np.array([1000.0, 30000.0, 50000.0, 0.0, 0.0, 0.25, 0.65, 1.0], dtype=np.float64)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        frt_sec = int((cycle_dt - epoch).total_seconds())
+        vt_secs = np.array([[frt_sec, frt_sec + 10800]], dtype=np.float64)
+
+        cams_ml_fp = cams_dir / "ECMWF-CAMS_ml_20261122.nc"
+        with Dataset(cams_ml_fp, "w") as d:
+            d.createDimension("forecast_period", 2)
+            d.createDimension("forecast_reference_time", 1)
+            d.createDimension("model_level", 3)
+            d.createDimension("latitude", len(lats_04))
+            d.createDimension("longitude", len(lons_04))
+            d.createVariable("forecast_period", "f8", ("forecast_period",))[:] = [0.0, 3.0]
+            d.createVariable("forecast_reference_time", "i8", ("forecast_reference_time",))[:] = [frt_sec]
+            vt = d.createVariable("valid_time", "f8", ("forecast_reference_time", "forecast_period"))
+            vt.units = "seconds since 1970-01-01"
+            vt[:] = vt_secs
+            d.createVariable("model_level", "f8", ("model_level",))[:] = [1, 2, 3]
+            d.createVariable("latitude", "f8", ("latitude",))[:] = lats_04
+            d.createVariable("longitude", "f8", ("longitude",))[:] = lons_04
+            for vname, val in [
+                ("t", 285.0), ("u", 5.0), ("v", -3.0), ("w", 0.01), ("q", 0.008),
+                ("clwc", 0.0), ("ciwc", 0.0), ("aermr04", 1e-8), ("aermr05", 2e-8), ("aermr06", 1e-8),
+                ("so2", 1e-9), ("no2", 2e-9), ("go3", 5e-8), ("co", 1e-7),
+            ]:
+                vv = d.createVariable(vname, "f4", ("forecast_period", "forecast_reference_time", "model_level", "latitude", "longitude"))
+                vv.GRIB_pv = pv
+                vv[:] = val
+
+        # 7a. Test convert_cams_to_wps across mixed 0.1° SFC + 0.4° ML
+        wps_files = convert_cams_to_wps(sfc_01_fp, cams_ml_fp, wps_dir, map_source="ECMWF IFS 0.1+CAMS")
+        assert len(wps_files) == 2
+        assert (wps_dir / "FILE:2026-11-22_00").is_file() and (wps_dir / "FILE:2026-11-22_03").is_file()
+
+        # 7b. Test ICON-ART IC + LatBC + CLI `cams2icon` on mixed 0.1° SFC + 0.4° ML
+        grid_fp = root / "domain.nc"
+        ext_fp = root / "extpar.nc"
+        lbc_grid_fp = root / "latbc_grid.nc"
+        clon_deg = np.array([50.2, 51.2, 51.3, 52.4])  # sea, land, land, sea
+        clat_deg = np.array([25.3, 25.3, 25.4, 25.5])
+        for gpath in (grid_fp, lbc_grid_fp):
+            with Dataset(gpath, "w") as g:
+                g.uuidOfHGrid = "test-uuid-qatar-001"
+                g.createDimension("cell", len(clon_deg))
+                g.createDimension("vertex", 6)
+                g.createDimension("nv", 3)
+                g.createVariable("clon", "f8", ("cell",))[:] = np.deg2rad(clon_deg)
+                g.createVariable("clat", "f8", ("cell",))[:] = np.deg2rad(clat_deg)
+                g.createVariable("clon_vertices", "f8", ("cell", "nv"))[:] = np.deg2rad(clon_deg)[:, None]
+                g.createVariable("clat_vertices", "f8", ("cell", "nv"))[:] = np.deg2rad(clat_deg)[:, None]
+        with Dataset(ext_fp, "w") as e:
+            e.createDimension("cell", len(clon_deg))
+            e.createVariable("FR_LAND", "f8", ("cell",))[:] = [0.0, 1.0, 1.0, 0.0]
+            e.createVariable("SOILTYP", "i4", ("cell",))[:] = [9, 3, 5, 9]
+            e.createVariable("T_CL", "f8", ("cell",))[:] = [299.0, 297.0, 297.0, 299.0]
+            e.createVariable("topography_c", "f8", ("cell",))[:] = [0.0, 20.0, 15.0, 0.0]
+            e.createVariable("emi_so2", "f4", ("cell",))[:] = [0.0, 1e-10, 1e-10, 0.0]
+            e.createVariable("emi_nox", "f4", ("cell",))[:] = [0.0, 2e-10, 2e-10, 0.0]
+            for k in ("fr_hcla", "fr_silc", "fr_lcla", "fr_sicl", "fr_cloa", "fr_silt", "fr_silo", "fr_scla", "fr_loam", "fr_sclo", "fr_sloa", "fr_lsan", "fr_sand", "fr_udef"):
+                e.createVariable(k, "f4", ("cell",))[:] = [0.0, 0.5, 0.5, 0.0] if k in ("fr_sand", "fr_udef") else [0.0, 0.0, 0.0, 0.0]
+
+        airblender_main([
+            "cams2icon",
+            "--cams_dir", str(cams_dir),
+            "--grid_file", str(grid_fp),
+            "--extpar_file", str(ext_fp),
+            "--latbc_grid_file", str(lbc_grid_fp),
+            "--run_dir", str(icon_run),
+            "--start_date", "2026-11-22_00:00:00",
+            "--end_date", "2026-11-22_03:00:00",
+            "--met_sfc_dir", str(ifs_dir),
+            "--met_sfc_prefix", "ECMWF-IFS-0p1_sfc",
+        ])
+        with Dataset(icon_run / "ifs2icon_R2B09_DOM01.nc") as di:
+            smil1 = np.asarray(di.variables["SMIL1"][0, 0, :])
+            skt = np.asarray(di.variables["SKT"][0, :])
+            assert np.all(np.isfinite(smil1)) and np.all(np.isfinite(skt))
+            assert smil1[0] == 0.0 and smil1[3] == 0.0, f"Expected 0 SMIL over sea, got {smil1}"
+            assert 0.0 < smil1[1] < 1.0 and 0.0 < smil1[2] < 1.0, f"Expected land SMIL in (0,1), got {smil1}"
+            assert skt[0] > skt[1] + 2.0, f"Expected land/sea SKT contrast preserved, got {skt}"
+        with Dataset(icon_run / "ART_STY_iconR2B09-grid_TCNR.nc") as dst:
+            fr_sand = np.asarray(dst.variables["fr_sand"][:])
+            assert fr_sand[0] == 0.0 and fr_sand[3] == 0.0 and fr_sand[1] > 0.0
+        assert (icon_run / "ART_IAE_iconR2B09-grid_TCNR.nc").is_file()
+        assert (icon_run / "ART_ICE_iconR2B09-grid_TCNR.nc").is_file()
+        assert (icon_run / "latbc" / "lbc_20261122T000000Z.nc").is_file()
+        assert (icon_run / "latbc" / "lbc_20261122T030000Z.nc").is_file()
+    print("  -> Test 7 PASSED.")
+
+
 def main() -> None:
     print("=" * 68)
     print(" Running AirBlender Verification Suite")
@@ -696,6 +987,8 @@ def main() -> None:
     test_cams2wps_and_wrf2palm()
     test_fetch_subpackage()
     test_cams_stream_daily()
+    test_dynamics_resolver_and_fallback()
+    test_mixed_grid_wps_and_cams2icon()
     print("=" * 68)
     print(" ALL AIRBLENDER CHECKS PASSED (100% OK)")
     print("=" * 68)

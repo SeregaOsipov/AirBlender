@@ -7,7 +7,8 @@ import sys
 from typing import Sequence
 
 from airblender.cams2wps import convert_cams_to_wps
-from airblender.fetch import cams_eac4, cams_forecast, ecmwf_ifs, era5_soil, merra2, opendata
+from airblender.fetch import cams_eac4, cams_forecast, dynamics, ecmwf_ifs, era5_soil, merra2, opendata
+from airblender.icon_icbc import prepare_icon_ic, prepare_icon_latbc
 from airblender.palm_dynamic import PALM_MODES, generate_palm_dynamic_driver
 from airblender.utils.time_io import parse_wrf_datetime
 from airblender.wrf_icbc import run_wrf_icbc
@@ -138,6 +139,84 @@ def main_wrf2palm(argv: Sequence[str] | None = None) -> None:
     )
 
 
+def _add_cams2icon_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cams_dir", required=True, help="Directory with ECMWF-CAMS_{ml,sfc,ghg}_*.nc")
+    parser.add_argument("--grid_file", required=True, help="ICON domain grid NetCDF")
+    parser.add_argument("--extpar_file", default=None, help="ICON external parameter NetCDF (required unless --latbc_only)")
+    parser.add_argument("--latbc_grid_file", default=None, help="ICON LatBC grid NetCDF (optional)")
+    parser.add_argument("--run_dir", required=True, help="Target ICON run directory")
+    parser.add_argument("--start_date", required=True, help="Cycle/window start UTC (YYYY-MM-DD or YYYY-MM-DD_HH:MM:SS)")
+    parser.add_argument("--end_date", default=None, help="LatBC end UTC (YYYY-MM-DD or YYYY-MM-DD_HH:MM:SS)")
+    parser.add_argument("--interval_hours", type=int, default=3, help="LatBC time step in hours (default: 3)")
+    parser.add_argument("--res_str", default="R2B09")
+    parser.add_argument("--suffix", default="TCNR")
+    parser.add_argument("--dom_id", type=int, default=1)
+    parser.add_argument("--met_sfc_dir", default=None, help="Optional separate surface donor directory")
+    parser.add_argument("--met_sfc_prefix", default="ECMWF-CAMS_sfc", help="Surface donor filename prefix")
+    parser.add_argument("--met_ml_dir", default=None, help="Optional separate 3D model-level donor directory")
+    parser.add_argument("--met_ml_prefix", default="ECMWF-CAMS_ml", help="3D model-level donor filename prefix")
+    parser.add_argument("--latbc_only", action="store_true", help="Only generate LatBC files")
+
+
+def _parse_iso_or_date_utc(raw: str):
+    from datetime import datetime, timezone
+
+    s = str(raw).strip().replace("_", " ").rstrip("Z")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    raise ValueError(f"Unrecognized UTC timestamp format: {raw!r}")
+
+
+def _dispatch_cams2icon(args: argparse.Namespace) -> None:
+    from datetime import timedelta
+
+    start_dt = _parse_iso_or_date_utc(args.start_date)
+    if not args.latbc_only:
+        if not args.extpar_file:
+            raise ValueError("--extpar_file is required unless --latbc_only is set")
+        prepare_icon_ic(
+            args.cams_dir,
+            args.grid_file,
+            args.extpar_file,
+            args.run_dir,
+            start_dt,
+            res_str=args.res_str,
+            cart_io_suffix=args.suffix,
+            dom_id=args.dom_id,
+            met_sfc_dir=args.met_sfc_dir,
+            met_sfc_prefix=args.met_sfc_prefix,
+            met_ml_dir=args.met_ml_dir,
+            met_ml_prefix=args.met_ml_prefix,
+        )
+    if args.latbc_grid_file:
+        end_dt = _parse_iso_or_date_utc(args.end_date) if args.end_date else start_dt
+        times = []
+        cur = start_dt
+        while cur <= end_dt:
+            times.append(cur)
+            cur += timedelta(hours=max(1, int(args.interval_hours)))
+        prepare_icon_latbc(
+            args.cams_dir,
+            args.latbc_grid_file,
+            args.run_dir,
+            times,
+            met_sfc_dir=args.met_sfc_dir,
+            met_sfc_prefix=args.met_sfc_prefix,
+            met_ml_dir=args.met_ml_dir,
+            met_ml_prefix=args.met_ml_prefix,
+        )
+
+
+def main_cams2icon(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="cams2icon", description="Convert ECMWF IFS/CAMS NetCDFs to ICON-ART IC & LatBC")
+    _add_cams2icon_arguments(parser)
+    args = parser.parse_args(argv)
+    _dispatch_cams2icon(args)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="airblender",
@@ -171,10 +250,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     p_palm.add_argument("--hours", type=float, default=None)
     p_palm.add_argument("--palm-mode", "--mode", dest="palm_mode", choices=PALM_MODES, default=None)
 
+    p_icon = sub.add_parser("cams2icon", help="ECMWF IFS/CAMS NetCDFs -> ICON-ART IC & LatBC")
+    _add_cams2icon_arguments(p_icon)
+
     cams_forecast.build_arg_parser(sub.add_parser("fetch-cams", help="Download ECMWF CAMS forecasts/analyses (GRIB pipelined)"))
     cams_eac4.build_arg_parser(sub.add_parser("fetch-eac4", help="Download daily ECMWF CAMS EAC4 reanalysis"))
     ecmwf_ifs.build_arg_parser(sub.add_parser("fetch-ifs", help="Download ECMWF MARS operational IFS NetCDFs"))
-    opendata.build_arg_parser(sub.add_parser("fetch-opendata", help="Download ECMWF OpenData HRES soil/surface GRIBs"))
+    opendata.build_arg_parser(sub.add_parser("fetch-opendata", help="Download ECMWF OpenData HRES soil/surface NetCDFs or GRIBs"))
+    dynamics.build_arg_parser(sub.add_parser("fetch-dynamics", help="Resolve and download highest-available dynamics with fallback"))
     era5_soil.build_arg_parser(sub.add_parser("fetch-era5-soil", help="Download ERA5 soil/surface NetCDFs"))
     merra2.build_arg_parser(sub.add_parser("fetch-merra2", help="Download NASA MERRA-2 GES DISC collections"))
 
@@ -221,6 +304,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             wrf_dir_override=args.wrf_dir,
             static_driver_override=args.static_driver,
         )
+    elif cmd == "cams2icon":
+        _dispatch_cams2icon(args)
     elif cmd == "fetch-cams":
         cams_forecast.apply_config_and_defaults(args)
         try:
@@ -246,14 +331,41 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=args.force,
         )
     elif cmd == "fetch-opendata":
-        if args.mode in ("sol", "both"):
-            opendata.download_opendata_soil(
-                date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
+        if args.mode == "s3-0p1":
+            if not args.date:
+                parser.error("fetch-opendata --mode s3-0p1 requires --date.")
+            out_dir = Path(args.outdir) if args.outdir is not None else opendata._default_hres_dir()
+            opendata.download_opendata_0p1_sfc_daily(
+                args.date,
+                out_dir,
+                time_str=f"{int(args.time):02d}:00",
+                leadtimes_hours=args.leadtimes,
+                area=args.area,
+                force=args.force,
             )
-        if args.mode in ("sfc", "both"):
-            opendata.download_opendata_sfc(
-                date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
-            )
+        else:
+            if args.mode in ("sol", "both"):
+                opendata.download_opendata_soil(
+                    date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
+                )
+            if args.mode in ("sfc", "both"):
+                opendata.download_opendata_sfc(
+                    date=args.date, out_dir=args.outdir, time=args.time, step=args.step, source=args.source, force=args.force
+                )
+    elif cmd == "fetch-dynamics":
+        import json
+
+        res = dynamics.resolve_and_fetch_dynamics(
+            args.date,
+            cams_dir=args.cams_dir,
+            out_dir=args.out_dir,
+            dynamics_cfg={"mode": args.mode, "primary": args.primary},
+            leadtimes_hours=args.leadtimes,
+            area=args.area,
+            provenance_dir=args.out_dir or Path(args.cams_dir).parent / "IFS",
+            force=args.force,
+        )
+        print(json.dumps(res.to_dict(), indent=2))
     elif cmd == "fetch-era5-soil":
         if not (args.date or args.start_date):
             parser.error("fetch-era5-soil requires --date or --start_date.")
