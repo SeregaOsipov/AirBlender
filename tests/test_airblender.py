@@ -53,7 +53,7 @@ def _make_wrf_grid_and_met(run_dir: Path, met_dir: Path, timestamps: list[str], 
         xlat[0, :, :] = lat2d
         xlon = d.createVariable("XLONG", "f4", ("Time", "south_north", "west_east"))
         xlon[0, :, :] = lon2d
-        for vname in ("co2", "ch4", "o3", "so2", "co", "no2", "so4aj", "ac0", "soila", "seas", "corn", "ecj", "orgpaj", "nu0", "no3aj", "nh4aj"):
+        for vname in ("co2", "ch4", "o3", "so2", "co", "no2", "ete", "macr", "so4aj", "ac0", "soila", "seas", "corn", "ecj", "orgpaj", "nu0", "no3aj", "nh4aj"):
             v = d.createVariable(vname, "f4", ("Time", "bottom_top", "south_north", "west_east"))
             v[0, :, :, :] = 123.0
 
@@ -67,7 +67,7 @@ def _make_wrf_grid_and_met(run_dir: Path, met_dir: Path, timestamps: list[str], 
             d.createDimension("south_north", ny)
             d.createDimension("west_east", nx)
             _write_char_times(d, timestamps)
-            for vname in ("co2", "ch4", "o3", "so2", "co", "no2", "so4aj", "ac0", "soila", "seas", "corn", "ecj", "orgpaj", "nu0", "no3aj", "nh4aj"):
+            for vname in ("co2", "ch4", "o3", "so2", "co", "no2", "ete", "macr", "so4aj", "ac0", "soila", "seas", "corn", "ecj", "orgpaj", "nu0", "no3aj", "nh4aj"):
                 for sfx, xdim in (("_BXS", "south_north"), ("_BXE", "south_north"), ("_BYS", "west_east"), ("_BYE", "west_east")):
                     vb = d.createVariable(vname + sfx, "f4", ("Time", "bdy_width", "bottom_top", xdim))
                     vb[:, :, :, :] = 99.0
@@ -183,7 +183,7 @@ def test_unified_cams_merra2_emac_icbc() -> None:
             la[:] = lats
             lo = d.createVariable("longitude", "f4", ("longitude",))
             lo[:] = lons
-            for name, base in [("go3", 1.0e-7), ("aermr04", 2.0e-8), ("ch4_c", 1.1e-6)]:
+            for name, base in [("go3", 1.0e-7), ("aermr04", 2.0e-8), ("ch4_c", 1.1e-6), ("c2h4", 3.0e-8), ("ispd", 4.0e-8)]:
                 v = d.createVariable(name, "f4", ("forecast_period", "model_level", "latitude", "longitude"))
                 v.GRIB_pv = pv
                 for ti in range(3):
@@ -224,8 +224,12 @@ def test_unified_cams_merra2_emac_icbc() -> None:
             assert np.allclose(d1.variables["co2"][0], 0.6582 * 6.5e-4 * 1e6, rtol=1e-4)
             assert np.allclose(d2.variables["co2"][0], 0.6582 * 6.5e-4 * 1e6, rtol=1e-4)
             assert np.allclose(d1.variables["ch4"][0], 1.8058 * 1.1e-6 * 1e6, rtol=1e-4)
+            assert np.allclose(d1.variables["ete"][0], 1.032 * 3.0e-8 * 1e6, rtol=1e-4)
+            assert np.allclose(d1.variables["macr"][0], 0.413 * 4.0e-8 * 1e6, rtol=1e-4)
+            assert "ol2" not in d1.variables
             assert np.allclose(db.variables["o3_BXS"][0], 0.604 * 1e-7 * 1e6, rtol=1e-4)
             assert np.allclose(db.variables["o3_BXS"][1], 0.604 * 2e-7 * 1e6, rtol=1e-4)
+            assert np.allclose(db.variables["ete_BXS"][0], 1.032 * 3.0e-8 * 1e6, rtol=1e-4)
             assert db.variables["o3_BTXS"][0].mean() > 0.0
 
         # --- B. MERRA-2 (with DELP fallback & caching) ---
@@ -495,7 +499,7 @@ def test_fetch_subpackage() -> None:
         )
         apply_config_and_defaults(ns)
         tasks = generate_tasks(ns)
-        assert len(tasks) == 48, f"Expected 48 tasks (1 sfc + 4 met + 41 chem + 2 ghg), got {len(tasks)}"
+        assert len(tasks) == 36, f"Expected 36 tasks (1 sfc + 5 met + 14 chema + 14 chemb + 2 ghg), got {len(tasks)}"
         assert all(t["num_fields"] <= 10000 for t in tasks), "Found task exceeding 10,000-field MARS limit"
 
         # Verify producer -> consumer daily NetCDF contract with CamsDonorAdapter
@@ -596,11 +600,11 @@ def test_cams_stream_daily() -> None:
         )
         apply_config_and_defaults(ns)
         tasks = generate_tasks(ns)
-        assert len(tasks) == 52, f"Expected 52 tasks across 5 daily buckets, got {len(tasks)}"
+        assert len(tasks) == 41, f"Expected 41 tasks across 5 daily buckets, got {len(tasks)}"
         date_spec = tasks[0]["date_spec"]
         assert [h["horizon_h"] for h in date_spec["horizons"]] == [24, 48, 72, 96, 120]
-        # Bucket 1 (tasks[:12]) must strictly stay within 0..24h for 3D met/chem/ghg (and 0..120h sfc)
-        assert all(max(int(lt) for lt in t["lt_chunk"]) <= 24 for t in tasks[1:12])
+        # Bucket 1 (tasks[:9]) must strictly stay within 0..24h for 3D met/chema/chemb/ghg (and 0..120h sfc)
+        assert all(max(int(lt) for lt in t["lt_chunk"]) <= 24 for t in tasks[1:9])
         assert max(int(lt) for lt in tasks[0]["lt_chunk"]) == 120  # single sfc_all request covers 0..120h
 
         pv = np.array([2000.0, 50000.0, 0.0, 0.0, 0.4, 1.0], dtype=np.float32)
@@ -633,7 +637,9 @@ def test_cams_stream_daily() -> None:
                 else:
                     if ":cams_met" in name:
                         vname = "u"
-                    elif ":cams_chem" in name:
+                    elif ":cams_chemb" in name:
+                        vname = "c2h4"
+                    elif ":cams_chema" in name or ":cams_chem_" in name:
                         vname = "go3"
                     else:
                         vname = "co2"
@@ -656,8 +662,8 @@ def test_cams_stream_daily() -> None:
                 ds.to_netcdf(nc_fp, encoding={"valid_time": {"units": "seconds since 1970-01-01", "dtype": "int64"}})
                 marker_fp.write_text("DONE\n", encoding="utf-8")
 
-        # Populate ONLY Bucket 1 (0..24h = 12 tasks)
-        _populate_task_chunks(tasks[:12])
+        # Populate ONLY Bucket 1 (0..24h = 9 tasks)
+        _populate_task_chunks(tasks[:9])
         check_and_flush_horizons(date_spec, ns)
         assert (stream_dir / ".cams_ready_20261114_h024.done").is_file()
         assert not (stream_dir / ".cams_ready_20261114_h048.done").exists()
@@ -665,6 +671,8 @@ def test_cams_stream_daily() -> None:
         for stream in ("sfc", "ml", "ghg"):
             with xr.open_dataset(stream_dir / f"ECMWF-CAMS_{stream}_20261114.nc") as ds_d0:
                 assert ds_d0.sizes["forecast_period"] == 8, f"{stream} day0 steps={ds_d0.sizes['forecast_period']}"
+                if stream == "ml":
+                    assert "go3" in ds_d0 and "c2h4" in ds_d0, f"Missing merged chema/chemb vars: {list(ds_d0.data_vars)}"
         for stream in ("ml", "ghg"):
             with xr.open_dataset(stream_dir / f"ECMWF-CAMS_{stream}_20261115.nc") as ds_d1:
                 assert ds_d1.sizes["forecast_period"] == 1, f"{stream} day1 steps={ds_d1.sizes['forecast_period']}"
@@ -674,8 +682,8 @@ def test_cams_stream_daily() -> None:
         mtime_day0 = ml_day0.stat().st_mtime_ns
         _time.sleep(0.02)
 
-        # Populate Bucket 2 (27..48h = 10 tasks)
-        _populate_task_chunks(tasks[12:22])
+        # Populate Bucket 2 (27..48h = 8 tasks)
+        _populate_task_chunks(tasks[9:17])
         check_and_flush_horizons(date_spec, ns)
         assert (stream_dir / ".cams_ready_20261114_h048.done").is_file()
         assert ml_day0.stat().st_mtime_ns == mtime_day0, "Completed Day 0 file should not be rewritten on Bucket 2 flush"
@@ -978,6 +986,81 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
     print("  -> Test 7 PASSED.")
 
 
+def test_cams_error_classification_and_circuit_breaker() -> None:
+    print("[Test 8] CAMS Cy49r1 sea-salt rename, error classification, fail-fast circuit breaker, & status JSON...")
+    import json
+    import sys
+    import time as _t
+    import types
+    from airblender.fetch.cams_forecast import (
+        _get_chem_groups_for_date,
+        classify_cams_error,
+        download_cams_forecast,
+    )
+
+    # 8a. Cy49r1 date-aware sea salt bin-1 name
+    grp_post = dict(_get_chem_groups_for_date("2026-11-22"))["chema"]
+    grp_pre = dict(_get_chem_groups_for_date("2026-04-01"))["chema"]
+    assert "sea_salt_aerosol_0.03-0.5um_mixing_ratio" in grp_post
+    assert "sea_salt_aerosol_0.03-0.55um_mixing_ratio" in grp_pre
+
+    # 8b. Error classification
+    assert classify_cams_error(RuntimeError("403 Client Error: Forbidden: required licences not accepted")) == (True, "auth_or_license")
+    assert classify_cams_error(RuntimeError("401 Client Error: Unauthorized")) == (True, "auth_or_license")
+    assert classify_cams_error(RuntimeError("400 Client Error: Bad Request")) == (True, "bad_request")
+    assert classify_cams_error(RuntimeError("400 Client Error: Bad Request\nThe job has failed\nMarsRuntimeError: Last error is -43")) == (False, "transient_backend")
+
+    # 8c. Fail-fast circuit breaker on 403 + atomic cams_status.json
+    calls = {"n": 0}
+    fake_cdsapi = types.ModuleType("cdsapi")
+    class _ForbiddenClient:
+        def __init__(self, **_kwargs):
+            pass
+        def retrieve(self, _col, _req, _target):
+            calls["n"] += 1
+            raise RuntimeError("403 Client Error: Forbidden: required licences not accepted")
+    fake_cdsapi.Client = _ForbiddenClient
+    old_cds = sys.modules.get("cdsapi")
+    sys.modules["cdsapi"] = fake_cdsapi
+
+    with tempfile.TemporaryDirectory(prefix="airblender_cb_") as td:
+        root = Path(td)
+        cams_dir = root / "cams"
+        status_fp = root / "cams_status.json"
+        t0 = _t.monotonic()
+        try:
+            try:
+                download_cams_forecast(
+                    "2026-11-22",
+                    "2026-11-22",
+                    cams_dir,
+                    cams_type="forecast",
+                    cams_time="00:00",
+                    ghg=False,
+                    stream_daily=True,
+                    max_workers=2,
+                    max_retries=5,
+                    status_file=status_fp,
+                )
+                raise AssertionError("Expected 403 licence error to abort CAMS pipeline")
+            except RuntimeError as exc:
+                assert "failed" in str(exc).lower()
+        finally:
+            if old_cds is None:
+                sys.modules.pop("cdsapi", None)
+            else:
+                sys.modules["cdsapi"] = old_cds
+
+        elapsed = _t.monotonic() - t0
+        assert elapsed < 2.0, f"Circuit breaker took too long: {elapsed:.2f}s"
+        assert calls["n"] <= 2, f"Expected fail-fast with 0 retries across max_workers=2, got {calls['n']} calls"
+        st_ext = json.loads(status_fp.read_text(encoding="utf-8"))
+        st_int = json.loads((cams_dir / ".cams_status_20261122.json").read_text(encoding="utf-8"))
+        assert st_ext["state"] == "failed" and st_int["state"] == "failed"
+        assert st_ext["counts"]["failed"] >= 1 and len(st_ext["failed_tasks"]) >= 1
+    print("  -> Test 8 PASSED.")
+
+
 def main() -> None:
     print("=" * 68)
     print(" Running AirBlender Verification Suite")
@@ -989,6 +1072,7 @@ def main() -> None:
     test_cams_stream_daily()
     test_dynamics_resolver_and_fallback()
     test_mixed_grid_wps_and_cams2icon()
+    test_cams_error_classification_and_circuit_breaker()
     print("=" * 68)
     print(" ALL AIRBLENDER CHECKS PASSED (100% OK)")
     print("=" * 68)

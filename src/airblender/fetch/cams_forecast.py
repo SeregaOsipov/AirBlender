@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import json
 import math
 import os
 from pathlib import Path
@@ -26,6 +27,8 @@ import threading
 import time
 from typing import Any, Sequence
 import zipfile
+
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import netCDF4
 import numpy as np
@@ -51,17 +54,7 @@ SURFACE_VARS = [
     "sea_ice_cover",
     "skin_temperature",
     "snow_depth",
-    "snow_density",
     "snow_albedo",
-    "temperature_of_snow_layer",
-    "volumetric_soil_water_layer_1",
-    "volumetric_soil_water_layer_2",
-    "volumetric_soil_water_layer_3",
-    "volumetric_soil_water_layer_4",
-    "soil_temperature_level_1",
-    "soil_temperature_level_2",
-    "soil_temperature_level_3",
-    "soil_temperature_level_4",
     "land_sea_mask",
     "skin_reservoir_content",
 ]
@@ -70,75 +63,82 @@ UPPER_AIR_VARS = [
     "u_component_of_wind",
     "v_component_of_wind",
     "vertical_velocity",
+    "temperature",
+    "specific_humidity",
     "specific_cloud_liquid_water_content",
     "specific_cloud_ice_water_content",
-    "geopotential",
 ]
 
-CHEM_VARS = [
-    "carbon_monoxide",
+CHEM_GROUP_A = [
     "dust_aerosol_0.03-0.55um_mixing_ratio",
     "dust_aerosol_0.55-0.9um_mixing_ratio",
     "dust_aerosol_0.9-20um_mixing_ratio",
-    "ethane",
-    "formaldehyde",
-    "hydrogen_peroxide",
-    "hydrophilic_black_carbon_aerosol_mixing_ratio",
-    "hydrophilic_organic_matter_aerosol_mixing_ratio",
-    "hydrophobic_black_carbon_aerosol_mixing_ratio",
-    "hydrophobic_organic_matter_aerosol_mixing_ratio",
-    "hydroxyl_radical",
-    "isoprene",
-    "nitric_acid",
-    "nitrogen_dioxide",
-    "nitrogen_monoxide",
-    "ozone",
-    "peroxyacetyl_nitrate",
-    "propane",
-    "sea_salt_aerosol_0.03-0.55um_mixing_ratio",
+    "sea_salt_aerosol_0.03-0.5um_mixing_ratio",
     "sea_salt_aerosol_0.5-5um_mixing_ratio",
     "sea_salt_aerosol_5-20um_mixing_ratio",
-    "specific_humidity",
+    "hydrophilic_organic_matter_aerosol_mixing_ratio",
+    "hydrophobic_organic_matter_aerosol_mixing_ratio",
+    "hydrophilic_black_carbon_aerosol_mixing_ratio",
+    "hydrophobic_black_carbon_aerosol_mixing_ratio",
     "sulphate_aerosol_mixing_ratio",
-    "sulphur_dioxide",
-    "temperature",
-    "acetone",
-    "acetone_product",
-    "aldehydes",
-    "amine",
-    "ammonia",
     "ammonium",
-    "dimethyl_sulfide",
-    "dinitrogen_pentoxide",
-    "ethanol",
-    "ethene",
-    "formic_acid",
-    "hydroperoxy_radical",
-    "lead",
-    "methacrolein_mvk",
-    "methacrylic_acid",
-    "methane",
-    "methane_sulfonic_acid",
-    "methanol",
-    "methyl_glyoxal",
-    "methyl_peroxide",
-    "methylperoxy_radical",
     "nitrate",
-    "nitrate_radical",
-    "olefins",
-    "organic_ethers",
-    "organic_nitrates",
-    "paraffins",
+    "ozone",
+    "carbon_monoxide",
+    "nitrogen_monoxide",
+    "nitrogen_dioxide",
+    "sulphur_dioxide",
+    "nitric_acid",
+    "hydrogen_peroxide",
+    "ammonia",
+    "dinitrogen_pentoxide",
     "pernitric_acid",
-    "peroxides",
-    "peroxy_acetyl_radical",
-    "propene",
-    "radon",
-    "stratospheric_ozone_tracer",
-    "terpenes",
+    "nitrate_radical",
 ]
 
+CHEM_GROUP_B = [
+    "hydroxyl_radical",
+    "hydroperoxy_radical",
+    "peroxyacetyl_nitrate",
+    "peroxy_acetyl_radical",
+    "organic_nitrates",
+    "methane",
+    "ethane",
+    "propane",
+    "paraffins",
+    "ethene",
+    "propene",
+    "olefins",
+    "isoprene",
+    "terpenes",
+    "formaldehyde",
+    "aldehydes",
+    "acetone",
+    "ethanol",
+    "methanol",
+    "formic_acid",
+    "methacrylic_acid",
+    "methyl_glyoxal",
+    "methacrolein_mvk",
+    "methyl_peroxide",
+]
+
+CHEM_VARS = CHEM_GROUP_A + CHEM_GROUP_B
+
 GHG_VARS = ["carbon_dioxide", "methane"]
+
+
+def _get_chem_groups_for_date(date_dash: str) -> list[tuple[str, list[str]]]:
+    """Return balanced 24-variable 3D chemistry/aerosol request groups adjusted for CAMS Cy49r1 rename."""
+    group_a = list(CHEM_GROUP_A)
+    if str(date_dash) < "2026-05-12":
+        group_a = [
+            "sea_salt_aerosol_0.03-0.55um_mixing_ratio"
+            if v == "sea_salt_aerosol_0.03-0.5um_mixing_ratio"
+            else v
+            for v in group_a
+        ]
+    return [("chema", group_a), ("chemb", list(CHEM_GROUP_B))]
 
 
 def log_msg(msg: str) -> None:
@@ -151,14 +151,14 @@ def get_thread_cds_client():
     import cdsapi
 
     if not hasattr(_THREAD_LOCAL, "client") or _THREAD_LOCAL.client is None:
-        _THREAD_LOCAL.client = cdsapi.Client()
+        _THREAD_LOCAL.client = cdsapi.Client(progress=sys.stdout.isatty())
     return _THREAD_LOCAL.client
 
 
 def reset_thread_cds_client():
     import cdsapi
 
-    _THREAD_LOCAL.client = cdsapi.Client()
+    _THREAD_LOCAL.client = cdsapi.Client(progress=sys.stdout.isatty())
     return _THREAD_LOCAL.client
 
 
@@ -276,11 +276,18 @@ def build_arg_parser(parser: argparse.ArgumentParser | None = None) -> argparse.
         default=None,
         help="Forecast horizon bucket size in hours when --stream_daily is enabled (default: 24)",
     )
+    parser.add_argument(
+        "--status_file",
+        default=None,
+        help="Optional path to atomic JSON live status file written throughout execution",
+    )
     return parser
 
 
 def apply_config_and_defaults(args: argparse.Namespace) -> None:
     args.data_root_folder = str(args.data_root_folder)
+    if not hasattr(args, "status_file"):
+        args.status_file = None
     cfg_data: dict[str, Any] = {}
     if args.config and os.path.exists(str(args.config)):
         with open(str(args.config), "r", encoding="utf-8") as f:
@@ -823,17 +830,23 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         explicit_lt_chunk=None if stream_daily else args.met_lt_chunk,
         explicit_level_chunks=args.level_chunks,
     )
-    chem_lvl_chunks, chem_lt_chunks, chem_f_per_lt, chem_max_lt = compute_stream_chunking(
-        len(CHEM_VARS),
-        all_levels,
-        num_times,
-        sorted_lts,
-        max_fields=args.max_fields,
-        explicit_lt_chunk=None if stream_daily else args.chem_lt_chunk,
-        explicit_level_chunks=args.level_chunks,
-    )
+    chem_groups_sample = _get_chem_groups_for_date(dates[0].to_timestamp().strftime("%Y-%m-%d") if len(dates) else "2026-11-22")
+    chem_group_chunks = [
+        compute_stream_chunking(
+            len(g_vars),
+            all_levels,
+            num_times,
+            sorted_lts,
+            max_fields=args.max_fields,
+            explicit_lt_chunk=None if stream_daily else args.chem_lt_chunk,
+            explicit_level_chunks=args.level_chunks,
+        )
+        for _, g_vars in chem_groups_sample
+    ]
 
     horizons_def = _build_horizon_buckets(sorted_lts, segment_hours) if stream_daily else []
+    chem_reqs_total = sum(len(gc[1]) * len(gc[0]) for gc in chem_group_chunks)
+    chem_max_fields = max(len(gc[1][0]) * gc[2] for gc in chem_group_chunks)
     plan_lines = [
         f"Chunking Plan (format={args.format}, max_fields={args.max_fields}, total_leadtimes={len(sorted_lts)}, "
         f"stream_daily={stream_daily}"
@@ -845,9 +858,9 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         f"  - 3D Met      : {len(UPPER_AIR_VARS)} vars x {len(met_lvl_chunks[0])} lvls = {met_f_per_lt} fields/lt "
         f"(max {met_max_lt} lts/req) -> {len(met_lt_chunks) * len(met_lvl_chunks)} request(s), "
         f"max {len(met_lt_chunks[0]) * met_f_per_lt} fields/req",
-        f"  - 3D Chem     : {len(CHEM_VARS)} vars x {len(chem_lvl_chunks[0])} lvls = {chem_f_per_lt} fields/lt "
-        f"(max {chem_max_lt} lts/req) -> {len(chem_lt_chunks) * len(chem_lvl_chunks)} request(s), "
-        f"max {len(chem_lt_chunks[0]) * chem_f_per_lt} fields/req",
+        f"  - 3D Chem (A/B): {len(chem_groups_sample)}x{len(chem_groups_sample[0][1])} vars x {len(chem_group_chunks[0][0][0])} lvls "
+        f"= {chem_group_chunks[0][2]} fields/lt (max {chem_group_chunks[0][3]} lts/req) -> {chem_reqs_total} request(s), "
+        f"max {chem_max_fields} fields/req",
     ]
     ghg_lvl_chunks, ghg_lt_chunks = [], []
     if effective_ghg:
@@ -876,6 +889,19 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         date = raw_date.to_timestamp()
         date_str = date.strftime("%Y%m%d")
         date_dash = date.strftime("%Y-%m-%d")
+        chem_groups = _get_chem_groups_for_date(date_dash)
+        chem_lvls_for_date = [
+            compute_stream_chunking(
+                len(g_vars),
+                all_levels,
+                num_times,
+                sorted_lts,
+                max_fields=args.max_fields,
+                explicit_lt_chunk=None if stream_daily else args.chem_lt_chunk,
+                explicit_level_chunks=args.level_chunks,
+            )
+            for _, g_vars in chem_groups
+        ]
 
         if args.type == "forecast" and not getattr(args, "no_split_days", False):
             max_lt = max(int(lt) for lt in sorted_lts)
@@ -912,6 +938,10 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         temp_raw_dir = os.path.join(args.data_root_folder, f"tmp_gribs_{date_str}")
         temp_extract_dir = os.path.join(args.data_root_folder, f"tmp_extract_{date_str}")
 
+        chem_groups_nc_by_lvl = [
+            [[] for _ in range(len(gc[0]))] if need_ml else []
+            for gc in chem_lvls_for_date
+        ]
         date_spec = {
             "date_str": date_str,
             "temp_raw_dir": temp_raw_dir,
@@ -922,7 +952,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
             "need_ghg": need_ghg,
             "sfc_nc_files": [],
             "met_nc_by_lvl": [[] for _ in range(len(met_lvl_chunks))] if need_ml else [],
-            "chem_nc_by_lvl": [[] for _ in range(len(chem_lvl_chunks))] if need_ml else [],
+            "chem_groups_nc_by_lvl": chem_groups_nc_by_lvl,
             "ghg_nc_by_lvl": [[] for _ in range(len(ghg_lvl_chunks))] if need_ghg else [],
             "horizons": [],
         }
@@ -931,7 +961,10 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         if stream_daily:
             cum_markers: list[str] = []
             cum_met_by_lvl: list[list[str]] = [[] for _ in range(len(met_lvl_chunks))] if need_ml else []
-            cum_chem_by_lvl: list[list[str]] = [[] for _ in range(len(chem_lvl_chunks))] if need_ml else []
+            cum_chem_groups_by_lvl: list[list[list[str]]] = [
+                [[] for _ in range(len(gc[0]))] if need_ml else []
+                for gc in chem_lvls_for_date
+            ]
             cum_ghg_by_lvl: list[list[str]] = [[] for _ in range(len(ghg_lvl_chunks))] if need_ghg else []
 
             for b_idx, (bound_h, b_lts) in enumerate(horizons_def):
@@ -950,6 +983,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                             temp_extract_dir=temp_extract_dir,
                             ac_collection=ac_collection,
                         )
+                        task["horizon_h"] = bound_h
                         date_spec["all_markers"].append(marker_fp)
                         date_spec["sfc_nc_files"].append(nc_fp)
                         cum_markers.append(marker_fp)
@@ -984,48 +1018,51 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                                 temp_raw_dir=temp_raw_dir,
                                 temp_extract_dir=temp_extract_dir,
                             )
+                            task["horizon_h"] = bound_h
                             date_spec["all_markers"].append(marker_fp)
                             date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
                             cum_markers.append(marker_fp)
                             cum_met_by_lvl[l_idx].append(nc_fp)
                             tasks.append(task)
 
-                    b_chem_lvls, b_chem_lts, _, _ = compute_stream_chunking(
-                        len(CHEM_VARS),
-                        all_levels,
-                        num_times,
-                        b_lts,
-                        max_fields=args.max_fields,
-                        explicit_lt_chunk=None,
-                        explicit_level_chunks=args.level_chunks,
-                    )
-                    for l_idx, lvl_chunk in enumerate(b_chem_lvls):
-                        for lt_chunk in b_chem_lts:
-                            lvl_suffix = "" if len(b_chem_lvls) == 1 else f"_part{l_idx}"
-                            if len(lt_chunk) == 1:
-                                base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
-                            else:
-                                base_name = f"cams_chem_h{int(lt_chunk[0]):03d}_{int(lt_chunk[-1]):03d}{lvl_suffix}"
-                            task, marker_fp, nc_fp = _make_3d_task(
-                                collection=ac_collection,
-                                variables=CHEM_VARS,
-                                date_str=date_str,
-                                date_dash=date_dash,
-                                base_name=base_name,
-                                lvl_chunk=lvl_chunk,
-                                lt_chunk=lt_chunk,
-                                times=times,
-                                include_type=True,
-                                args=args,
-                                date_spec=date_spec,
-                                temp_raw_dir=temp_raw_dir,
-                                temp_extract_dir=temp_extract_dir,
-                            )
-                            date_spec["all_markers"].append(marker_fp)
-                            date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
-                            cum_markers.append(marker_fp)
-                            cum_chem_by_lvl[l_idx].append(nc_fp)
-                            tasks.append(task)
+                    for g_idx, (g_tag, g_vars) in enumerate(chem_groups):
+                        b_chem_lvls, b_chem_lts, _, _ = compute_stream_chunking(
+                            len(g_vars),
+                            all_levels,
+                            num_times,
+                            b_lts,
+                            max_fields=args.max_fields,
+                            explicit_lt_chunk=None,
+                            explicit_level_chunks=args.level_chunks,
+                        )
+                        for l_idx, lvl_chunk in enumerate(b_chem_lvls):
+                            for lt_chunk in b_chem_lts:
+                                lvl_suffix = "" if len(b_chem_lvls) == 1 else f"_part{l_idx}"
+                                if len(lt_chunk) == 1:
+                                    base_name = f"cams_{g_tag}_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
+                                else:
+                                    base_name = f"cams_{g_tag}_h{int(lt_chunk[0]):03d}_{int(lt_chunk[-1]):03d}{lvl_suffix}"
+                                task, marker_fp, nc_fp = _make_3d_task(
+                                    collection=ac_collection,
+                                    variables=g_vars,
+                                    date_str=date_str,
+                                    date_dash=date_dash,
+                                    base_name=base_name,
+                                    lvl_chunk=lvl_chunk,
+                                    lt_chunk=lt_chunk,
+                                    times=times,
+                                    include_type=True,
+                                    args=args,
+                                    date_spec=date_spec,
+                                    temp_raw_dir=temp_raw_dir,
+                                    temp_extract_dir=temp_extract_dir,
+                                )
+                                task["horizon_h"] = bound_h
+                                date_spec["all_markers"].append(marker_fp)
+                                date_spec["chem_groups_nc_by_lvl"][g_idx][l_idx].append(nc_fp)
+                                cum_markers.append(marker_fp)
+                                cum_chem_groups_by_lvl[g_idx][l_idx].append(nc_fp)
+                                tasks.append(task)
 
                 if need_ghg:
                     b_ghg_lvls, b_ghg_lts, _, _ = compute_stream_chunking(
@@ -1056,6 +1093,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                                 temp_raw_dir=temp_raw_dir,
                                 temp_extract_dir=temp_extract_dir,
                             )
+                            task["horizon_h"] = bound_h
                             date_spec["all_markers"].append(marker_fp)
                             date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
                             cum_markers.append(marker_fp)
@@ -1069,7 +1107,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                         "required_markers": list(cum_markers),
                         "sfc_nc_files": list(date_spec["sfc_nc_files"]),
                         "met_nc_by_lvl": [list(g) for g in cum_met_by_lvl],
-                        "chem_nc_by_lvl": [list(g) for g in cum_chem_by_lvl],
+                        "chem_groups_nc_by_lvl": [[list(lv) for lv in grp] for grp in cum_chem_groups_by_lvl],
                         "ghg_nc_by_lvl": [list(g) for g in cum_ghg_by_lvl],
                     }
                 )
@@ -1090,11 +1128,12 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                         temp_extract_dir=temp_extract_dir,
                         ac_collection=ac_collection,
                     )
+                    task["horizon_h"] = None
                     date_spec["all_markers"].append(marker_fp)
                     date_spec["sfc_nc_files"].append(nc_fp)
                     tasks.append(task)
 
-            # 2. 3D Met & Chem Tasks
+            # 2. 3D Met & Chem Groups (A/B) Tasks
             if need_ml:
                 for l_idx, lvl_chunk in enumerate(met_lvl_chunks):
                     for c_idx, lt_chunk in enumerate(met_lt_chunks):
@@ -1115,35 +1154,38 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                             temp_raw_dir=temp_raw_dir,
                             temp_extract_dir=temp_extract_dir,
                         )
+                        task["horizon_h"] = None
                         date_spec["all_markers"].append(marker_fp)
                         date_spec["met_nc_by_lvl"][l_idx].append(nc_fp)
                         tasks.append(task)
 
-                for l_idx, lvl_chunk in enumerate(chem_lvl_chunks):
-                    for c_idx, lt_chunk in enumerate(chem_lt_chunks):
-                        lvl_suffix = "" if len(chem_lvl_chunks) == 1 else f"_part{l_idx}"
-                        if len(lt_chunk) == 1:
-                            base_name = f"cams_chem_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
-                        else:
-                            base_name = f"cams_chem_chunk_{c_idx}{lvl_suffix}"
-                        task, marker_fp, nc_fp = _make_3d_task(
-                            collection=ac_collection,
-                            variables=CHEM_VARS,
-                            date_str=date_str,
-                            date_dash=date_dash,
-                            base_name=base_name,
-                            lvl_chunk=lvl_chunk,
-                            lt_chunk=lt_chunk,
-                            times=times,
-                            include_type=True,
-                            args=args,
-                            date_spec=date_spec,
-                            temp_raw_dir=temp_raw_dir,
-                            temp_extract_dir=temp_extract_dir,
-                        )
-                        date_spec["all_markers"].append(marker_fp)
-                        date_spec["chem_nc_by_lvl"][l_idx].append(nc_fp)
-                        tasks.append(task)
+                for g_idx, ((g_tag, g_vars), (c_lvls, c_lts, _, _)) in enumerate(zip(chem_groups, chem_lvls_for_date)):
+                    for l_idx, lvl_chunk in enumerate(c_lvls):
+                        for c_idx, lt_chunk in enumerate(c_lts):
+                            lvl_suffix = "" if len(c_lvls) == 1 else f"_part{l_idx}"
+                            if len(lt_chunk) == 1:
+                                base_name = f"cams_{g_tag}_lt_{int(lt_chunk[0]):03d}{lvl_suffix}"
+                            else:
+                                base_name = f"cams_{g_tag}_chunk_{c_idx}{lvl_suffix}"
+                            task, marker_fp, nc_fp = _make_3d_task(
+                                collection=ac_collection,
+                                variables=g_vars,
+                                date_str=date_str,
+                                date_dash=date_dash,
+                                base_name=base_name,
+                                lvl_chunk=lvl_chunk,
+                                lt_chunk=lt_chunk,
+                                times=times,
+                                include_type=True,
+                                args=args,
+                                date_spec=date_spec,
+                                temp_raw_dir=temp_raw_dir,
+                                temp_extract_dir=temp_extract_dir,
+                            )
+                            task["horizon_h"] = None
+                            date_spec["all_markers"].append(marker_fp)
+                            date_spec["chem_groups_nc_by_lvl"][g_idx][l_idx].append(nc_fp)
+                            tasks.append(task)
 
             # 3. 3D GHG Tasks (0.1 deg CO2 & CH4; forecast-only at 00:00 UTC)
             if need_ghg:
@@ -1166,6 +1208,7 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
                             temp_raw_dir=temp_raw_dir,
                             temp_extract_dir=temp_extract_dir,
                         )
+                        task["horizon_h"] = None
                         date_spec["all_markers"].append(marker_fp)
                         date_spec["ghg_nc_by_lvl"][l_idx].append(nc_fp)
                         tasks.append(task)
@@ -1183,6 +1226,142 @@ def is_http_400_error(exc: Exception) -> bool:
     if "400 Client Error" in msg or "400 Bad Request" in msg:
         return True
     return False
+
+
+def classify_cams_error(exc: Exception) -> tuple[bool, str]:
+    """
+    Classify an ADS exception into `(is_fatal, category)`:
+      - `auth_or_license`: HTTP 401/403, missing licence, disabled user, cost limit -> fail fast.
+      - `bad_request`: HTTP 400 at submission (without server job failure) -> fail fast.
+      - `transient_backend`: MarsRuntimeError (`Last error is -43`), 429/5xx, network errors -> retryable.
+    """
+    msg = str(exc)
+    msg_l = msg.lower()
+    resp = getattr(exc, "response", None)
+    status_code = getattr(resp, "status_code", None)
+    if (
+        status_code in (401, 403)
+        or "401 client error" in msg_l
+        or "403 client error" in msg_l
+        or "unauthorized" in msg_l
+        or "required licences" in msg_l
+        or "licences not accepted" in msg_l
+        or "user has been disabled" in msg_l
+        or "cost limits exceeded" in msg_l
+    ):
+        return True, "auth_or_license"
+    if is_http_400_error(exc):
+        return True, "bad_request"
+    return False, "transient_backend"
+
+
+class _CamsStatusTracker:
+    """Thread-safe atomic JSON progress writer for CAMS chunk downloads & horizon readiness."""
+
+    def __init__(self, tasks: list[dict], status_paths: Sequence[str | Path]) -> None:
+        self._lock = threading.Lock()
+        self._paths = [Path(p) for p in status_paths if p]
+        self._state = "running"
+        self._closed = False
+        self._ready_horizons: set[int] = set()
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._horizon_order: list[int] = []
+        for t in tasks:
+            hh = t.get("horizon_h")
+            if hh is not None and int(hh) not in self._horizon_order:
+                self._horizon_order.append(int(hh))
+            self._tasks[t["name"]] = {
+                "name": t["name"],
+                "horizon_h": int(hh) if hh is not None else None,
+                "state": "pending",
+                "attempts": 0,
+                "error": None,
+            }
+        self._horizon_order.sort()
+        self._write_locked()
+
+    def mark_state(
+        self,
+        task_name: str,
+        state: str,
+        *,
+        error: str | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            entry = self._tasks.get(task_name)
+            if entry is not None:
+                entry["state"] = state
+                if attempt is not None:
+                    entry["attempts"] = int(attempt)
+                if error is not None:
+                    entry["error"] = str(error).splitlines()[0][:240]
+            self._write_locked()
+
+    def mark_horizon_ready(self, horizon_h: int) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._ready_horizons.add(int(horizon_h))
+            self._write_locked()
+
+    def finish(self, state: str) -> None:
+        with self._lock:
+            if self._closed and self._state == state:
+                return
+            self._state = state
+            self._write_locked()
+            self._closed = True
+
+    def _build_payload_locked(self) -> dict[str, Any]:
+        counts = {"total": len(self._tasks), "completed": 0, "running": 0, "retrying": 0, "pending": 0, "failed": 0}
+        active_tasks: list[str] = []
+        failed_tasks: list[dict[str, str]] = []
+        for entry in self._tasks.values():
+            st = entry["state"]
+            if st in counts:
+                counts[st] += 1
+            if st in ("running", "retrying"):
+                active_tasks.append(entry["name"])
+            elif st == "failed":
+                failed_tasks.append({"name": entry["name"], "error": entry["error"] or "unknown error"})
+
+        horizons_summary: list[dict[str, Any]] = []
+        for hh in self._horizon_order:
+            h_entries = [e for e in self._tasks.values() if e["horizon_h"] == hh]
+            horizons_summary.append(
+                {
+                    "horizon_h": hh,
+                    "done": sum(1 for e in h_entries if e["state"] == "completed"),
+                    "total": len(h_entries),
+                    "ready": hh in self._ready_horizons,
+                    "failed": sum(1 for e in h_entries if e["state"] == "failed"),
+                }
+            )
+
+        return {
+            "state": self._state,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "counts": counts,
+            "horizons": horizons_summary,
+            "active_tasks": active_tasks[:12],
+            "failed_tasks": failed_tasks,
+        }
+
+    def _write_locked(self) -> None:
+        if not self._paths:
+            return
+        payload = json.dumps(self._build_payload_locked(), indent=2) + "\n"
+        for fp in self._paths:
+            try:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                tmp_fp = fp.parent / f".{fp.name}.tmp.{os.getpid()}"
+                tmp_fp.write_text(payload, encoding="utf-8")
+                os.replace(tmp_fp, fp)
+            except OSError:
+                pass
 
 
 def _merge_and_save_3d_groups(
@@ -1242,7 +1421,8 @@ def _flush_date_spec(
     need_ghg: bool,
     sfc_files: list[str],
     met_nc_by_lvl: list[list[str]],
-    chem_nc_by_lvl: list[list[str]],
+    chem_nc_by_lvl: list[list[str]] | None = None,
+    chem_groups_nc_by_lvl: list[list[list[str]]] | None = None,
     ghg_nc_by_lvl: list[list[str]],
     args: argparse.Namespace,
     skip_if_steps_ge: bool = False,
@@ -1267,10 +1447,16 @@ def _flush_date_spec(
             for ds in opened_sfc:
                 ds.close()
 
-    if need_ml and met_nc_by_lvl and chem_nc_by_lvl:
+    all_chem_groups: list[list[list[str]]] = []
+    if chem_groups_nc_by_lvl:
+        all_chem_groups.extend(g for g in chem_groups_nc_by_lvl if g)
+    elif chem_nc_by_lvl:
+        all_chem_groups.append(chem_nc_by_lvl)
+
+    if need_ml and met_nc_by_lvl and all_chem_groups:
         _merge_and_save_3d_groups(
             "ml",
-            [met_nc_by_lvl, chem_nc_by_lvl],
+            [met_nc_by_lvl, *all_chem_groups],
             date_str,
             args,
             skip_if_steps_ge=skip_if_steps_ge,
@@ -1286,7 +1472,11 @@ def _flush_date_spec(
         )
 
 
-def check_and_flush_horizons(date_spec: dict, args: argparse.Namespace) -> None:
+def check_and_flush_horizons(
+    date_spec: dict,
+    args: argparse.Namespace,
+    status_tracker: _CamsStatusTracker | None = None,
+) -> None:
     """Incrementally flush cumulative daily NetCDFs whenever a horizon bucket finishes."""
     horizons = date_spec.get("horizons")
     if not horizons:
@@ -1296,6 +1486,8 @@ def check_and_flush_horizons(date_spec: dict, args: argparse.Namespace) -> None:
         for h_spec in horizons:
             ready_marker = h_spec["ready_marker"]
             if os.path.exists(ready_marker):
+                if status_tracker is not None:
+                    status_tracker.mark_horizon_ready(int(h_spec["horizon_h"]))
                 continue
             if not all(os.path.exists(m) for m in h_spec["required_markers"]):
                 break
@@ -1307,7 +1499,8 @@ def check_and_flush_horizons(date_spec: dict, args: argparse.Namespace) -> None:
                 need_ghg=bool(date_spec.get("need_ghg")),
                 sfc_files=h_spec["sfc_nc_files"],
                 met_nc_by_lvl=h_spec["met_nc_by_lvl"],
-                chem_nc_by_lvl=h_spec["chem_nc_by_lvl"],
+                chem_nc_by_lvl=h_spec.get("chem_nc_by_lvl"),
+                chem_groups_nc_by_lvl=h_spec.get("chem_groups_nc_by_lvl"),
                 ghg_nc_by_lvl=h_spec["ghg_nc_by_lvl"],
                 args=args,
                 skip_if_steps_ge=True,
@@ -1316,6 +1509,8 @@ def check_and_flush_horizons(date_spec: dict, args: argparse.Namespace) -> None:
             with open(tmp_marker, "w", encoding="utf-8") as f:
                 f.write("DONE\n")
             os.replace(tmp_marker, ready_marker)
+            if status_tracker is not None:
+                status_tracker.mark_horizon_ready(int(h_spec["horizon_h"]))
             log_msg(
                 f"[STREAM-READY] {date_str}: horizon 0..{h_spec['horizon_h']}h ready "
                 f"in {time.time() - t_start:.1f}s ({os.path.basename(ready_marker)})"
@@ -1347,7 +1542,8 @@ def check_and_merge(date_spec: dict, args: argparse.Namespace, *, skip_if_steps_
             need_ghg=bool(date_spec.get("need_ghg")),
             sfc_files=date_spec.get("sfc_nc_files", []),
             met_nc_by_lvl=date_spec.get("met_nc_by_lvl", []),
-            chem_nc_by_lvl=date_spec.get("chem_nc_by_lvl", []),
+            chem_nc_by_lvl=date_spec.get("chem_nc_by_lvl"),
+            chem_groups_nc_by_lvl=date_spec.get("chem_groups_nc_by_lvl"),
             ghg_nc_by_lvl=date_spec.get("ghg_nc_by_lvl", []),
             args=args,
             skip_if_steps_ge=skip_if_steps_ge,
@@ -1369,7 +1565,18 @@ def check_and_merge(date_spec: dict, args: argparse.Namespace, *, skip_if_steps_
         log_msg(f"[CLEANUP-WARN] Could not fully clean up temp directories: {e}")
 
 
-def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: bool = False) -> None:
+def run_task(
+    task: dict,
+    args: argparse.Namespace,
+    client=None,
+    defer_merge: bool = False,
+    *,
+    abort_event: threading.Event | None = None,
+    status_tracker: _CamsStatusTracker | None = None,
+) -> None:
+    if abort_event is not None and abort_event.is_set():
+        raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+
     os.makedirs(task["temp_raw_dir"], exist_ok=True)
     os.makedirs(task["temp_extract_dir"], exist_ok=True)
 
@@ -1381,6 +1588,8 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
     if os.path.exists(task["marker"]) and os.path.exists(task["output_nc"]):
         nc_size_mb = os.path.getsize(task["output_nc"]) / (1024.0 * 1024.0)
         log_msg(f"[SKIPPED] {task['name']} | Already completed ({os.path.basename(task['output_nc'])}, {nc_size_mb:.2f} MB)")
+        if status_tracker is not None:
+            status_tracker.mark_state(task["name"], "completed")
     else:
         t_chunk_start = time.time()
         lt_desc = (
@@ -1396,6 +1605,8 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                 f"[FOUND-RAW] {task['name']} | Found existing {os.path.basename(task['output_raw'])} "
                 f"({raw_size_mb:.2f} MB), attempting conversion..."
             )
+            if status_tracker is not None:
+                status_tracker.mark_state(task["name"], "running", attempt=0)
             try:
                 t_conv_start = time.time()
                 if task["format"] == "grib":
@@ -1413,6 +1624,8 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                     f"[CONVERTED] {task['name']} | netcdf={os.path.basename(task['output_nc'])} ({nc_size_mb:.2f} MB) | "
                     f"conv_elapsed={conv_elapsed:.1f}s"
                 )
+                if status_tracker is not None:
+                    status_tracker.mark_state(task["name"], "completed")
                 need_download = False
             except Exception as conv_err:
                 log_msg(
@@ -1425,6 +1638,9 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                     pass
 
         if need_download:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+
             is_ghg_task = task.get("collection") == "cams-global-greenhouse-gas-forecasts"
             ghg_poll_deadline_utc = None
             if is_ghg_task:
@@ -1444,7 +1660,12 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                             rem = (ghg_ready_utc - dt.datetime.now(dt.timezone.utc)).total_seconds()
                             if rem <= 0:
                                 break
-                            time.sleep(min(300.0, rem))
+                            sleep_s = min(300.0, rem)
+                            if abort_event is not None:
+                                if abort_event.wait(sleep_s):
+                                    raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+                            else:
+                                time.sleep(sleep_s)
                 except ValueError:
                     ghg_poll_deadline_utc = None
 
@@ -1454,10 +1675,16 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
             )
 
             max_retries = max(0, int(getattr(args, "max_retries", 3)))
+            retry_base_s = float(getattr(args, "_retry_base_sec", 45.0))
             c = client or get_thread_cds_client()
 
             attempt = 0
             while True:
+                if abort_event is not None and abort_event.is_set():
+                    raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+                if status_tracker is not None:
+                    status_tracker.mark_state(task["name"], "running", attempt=attempt + 1)
+
                 t_req_start = time.time()
                 try:
                     c.retrieve(
@@ -1479,9 +1706,11 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                         except OSError:
                             pass
 
-                    if is_http_400_error(e):
+                    is_fatal, err_cat = classify_cams_error(e)
+                    if is_fatal:
                         if (
-                            is_ghg_task
+                            err_cat == "bad_request"
+                            and is_ghg_task
                             and ghg_poll_deadline_utc is not None
                             and dt.datetime.now(dt.timezone.utc) < ghg_poll_deadline_utc
                         ):
@@ -1489,22 +1718,40 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
                                 f"[GHG-WAIT] {task['name']} | ADS GHG not yet published in catalogue "
                                 f"(HTTP 400); polling again in 600s..."
                             )
-                            time.sleep(600)
+                            if abort_event is not None:
+                                if abort_event.wait(600.0):
+                                    raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+                            else:
+                                time.sleep(600.0)
                             c = reset_thread_cds_client()
                             continue
-                        log_msg(f"[FAILED-FAST] {task['name']} | Non-retryable HTTP 400 Bad Request: {e}")
+                        if status_tracker is not None:
+                            status_tracker.mark_state(task["name"], "failed", error=str(e), attempt=attempt + 1)
+                        if abort_event is not None:
+                            abort_event.set()
+                        log_msg(f"[FAILED-FAST] {task['name']} | Non-retryable {err_cat}: {e}")
                         raise
 
                     if attempt < max_retries:
-                        backoff_s = (2**attempt) * 15
+                        backoff_s = min(300.0, retry_base_s * (2**attempt))
+                        if status_tracker is not None:
+                            status_tracker.mark_state(task["name"], "retrying", error=str(e), attempt=attempt + 1)
                         log_msg(
                             f"[RETRY {attempt + 1}/{max_retries}] {task['name']} | "
-                            f"Transient error: {e} | Waiting {backoff_s}s before retry..."
+                            f"{err_cat}: {e} | Waiting {backoff_s:g}s before retry..."
                         )
-                        time.sleep(backoff_s)
+                        if abort_event is not None:
+                            if abort_event.wait(backoff_s):
+                                raise RuntimeError("Task cancelled after fatal CAMS pipeline error")
+                        else:
+                            time.sleep(backoff_s)
                         attempt += 1
                         c = reset_thread_cds_client()
                     else:
+                        if status_tracker is not None:
+                            status_tracker.mark_state(task["name"], "failed", error=str(e), attempt=attempt + 1)
+                        if abort_event is not None:
+                            abort_event.set()
                         log_msg(f"[FAILED] {task['name']} | Exhausted {max_retries} retries. Last error: {e}")
                         raise
 
@@ -1523,6 +1770,9 @@ def run_task(task: dict, args: argparse.Namespace, client=None, defer_merge: boo
 
             with open(task["marker"], "w", encoding="utf-8") as f:
                 f.write("DONE\n")
+
+            if status_tracker is not None:
+                status_tracker.mark_state(task["name"], "completed")
 
             log_msg(
                 f"[CONVERTED] {task['name']} | netcdf={os.path.basename(task['output_nc'])} ({nc_size_mb:.2f} MB) | "
@@ -1552,24 +1802,62 @@ def execute_cams_pipeline(args: argparse.Namespace) -> list[dict]:
         run_task(task, args, defer_merge=False)
         return tasks
 
+    status_paths: list[str | Path] = [
+        Path(args.data_root_folder) / f".cams_status_{tasks[0]['date_str']}.json",
+    ]
+    if getattr(args, "status_file", None):
+        status_paths.append(args.status_file)
+    status_tracker = _CamsStatusTracker(tasks, status_paths)
+    abort_event = threading.Event()
+
     max_workers = max(1, int(args.max_workers))
     log_msg(f"Starting ThreadPoolExecutor queue pipeline with max_workers={max_workers} across {len(tasks)} total tasks...")
 
     t_all_start = time.time()
     failures: list[tuple[str, Exception]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_task = {executor.submit(run_task, task, args, None, True): task for task in tasks}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    future_to_task = {
+        executor.submit(
+            run_task,
+            task,
+            args,
+            None,
+            True,
+            abort_event=abort_event,
+            status_tracker=status_tracker,
+        ): task
+        for task in tasks
+    }
+    try:
         for future in concurrent.futures.as_completed(future_to_task):
             task = future_to_task[future]
             try:
                 future.result()
                 if getattr(args, "stream_daily", False):
-                    check_and_flush_horizons(task["date_spec"], args)
+                    check_and_flush_horizons(task["date_spec"], args, status_tracker=status_tracker)
             except Exception as exc:
                 failures.append((task["name"], exc))
+                status_tracker.mark_state(task["name"], "failed", error=str(exc))
+                status_tracker.finish("failed")
                 log_msg(f"[TASK-ERROR] {task['name']} raised exception: {exc}")
+                abort_event.set()
+                for pending_fut in future_to_task:
+                    pending_fut.cancel()
+                break
+    except Exception:
+        abort_event.set()
+        status_tracker.finish("failed")
+        for pending_fut in future_to_task:
+            pending_fut.cancel()
+        raise
+    finally:
+        if failures:
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     if failures:
+        status_tracker.finish("failed")
         log_msg(f"Pipeline failed with {len(failures)} failed task(s):")
         for name, exc in failures:
             log_msg(f"  - {name}: {exc}")
@@ -1586,6 +1874,7 @@ def execute_cams_pipeline(args: argparse.Namespace) -> list[dict]:
                 skip_if_steps_ge=bool(getattr(args, "stream_daily", False)),
             )
 
+    status_tracker.finish("completed")
     total_wall = time.time() - t_all_start
     log_msg(
         f"[ALL-COMPLETE] All {len(tasks)} tasks and daily merges finished in {total_wall:.1f}s ({total_wall / 60.0:.2f}m)."
@@ -1621,6 +1910,7 @@ def download_cams_forecast(
     no_split_days: bool = False,
     stream_daily: bool | None = None,
     segment_hours: int | None = 24,
+    status_file: str | Path | None = None,
 ) -> list[dict]:
     """Programmatic entry point matching the CAMS GRIB pipelined downloader CLI."""
     if leadtimes is not None:
@@ -1659,6 +1949,7 @@ def download_cams_forecast(
         no_split_days=bool(no_split_days),
         stream_daily=stream_daily,
         segment_hours=segment_hours,
+        status_file=str(status_file) if status_file is not None else None,
     )
     apply_config_and_defaults(ns)
     return execute_cams_pipeline(ns)
