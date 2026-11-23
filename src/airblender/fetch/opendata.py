@@ -43,6 +43,7 @@ OPENDATA_0P1_SFC_PARAMS = frozenset({
     "sot",
     "vsw",
 })
+OPENDATA_INVARIANT_SFC_PARAMS = ("z", "lsm")
 
 
 def _default_hres_dir() -> Path:
@@ -321,11 +322,70 @@ def _existing_cdm_steps(path: Path) -> int:
         return 0
     try:
         with netCDF4.Dataset(path, "r") as ds:
-            if "forecast_period" in ds.dimensions:
-                return len(ds.dimensions["forecast_period"])
+            if "forecast_period" not in ds.dimensions:
+                return 0
+            n_fp = len(ds.dimensions["forecast_period"])
+            if n_fp <= 0:
+                return 0
+            for k in OPENDATA_INVARIANT_SFC_PARAMS:
+                if k not in ds.variables:
+                    return 0
+                v = ds.variables[k]
+                if not np.isfinite(np.ma.filled(v[0], np.nan)).any():
+                    return 0
+                if n_fp > 1 and not np.isfinite(np.ma.filled(v[-1], np.nan)).any():
+                    return 0
+            return n_fp
     except Exception:
         return 0
-    return 0
+
+
+def _load_or_fetch_step0_invariants(
+    clean_date: str,
+    hh: str,
+    target_dir: Path,
+    area: Sequence[float] | None,
+    s3_base_url: str,
+) -> dict[str, xr.DataArray]:
+    """Load step-0 static invariants (`z`, `lsm`) from Day-1 NetCDF or OpenData step 0."""
+    day0_fp = target_dir / f"ECMWF-IFS-0p1_sfc_{clean_date}.nc"
+    if day0_fp.is_file() and day0_fp.stat().st_size > 0:
+        try:
+            with xr.open_dataset(day0_fp) as ds0:
+                found: dict[str, xr.DataArray] = {}
+                for k in OPENDATA_INVARIANT_SFC_PARAMS:
+                    if k not in ds0:
+                        continue
+                    da = ds0[k]
+                    if "forecast_period" in da.dims:
+                        da = da.isel(forecast_period=0)
+                    if "forecast_reference_time" in da.dims:
+                        da = da.isel(forecast_reference_time=0)
+                    da2 = da.squeeze(drop=True)
+                    if set(da2.dims) == {"latitude", "longitude"} and np.isfinite(da2.values).any():
+                        found[k] = da2.load()
+                if all(k in found for k in OPENDATA_INVARIANT_SFC_PARAMS):
+                    return found
+        except Exception:
+            pass
+
+    idx_rel, grib_rel = _build_0p1_rel_paths(clean_date, hh, 0, levtype_group="sfc")
+    idx_raw = _http_get_rel(idx_rel, s3_base_url=s3_base_url, timeout=20.0).decode("utf-8")
+    records = [json.loads(line) for line in idx_raw.splitlines() if line.strip()]
+    wanted = [r for r in records if r.get("param") in OPENDATA_INVARIANT_SFC_PARAMS]
+    ranges = _coalesce_byte_ranges(wanted)
+    if not ranges:
+        return {}
+    chunks = [
+        _http_get_rel(grib_rel, s3_base_url=s3_base_url, byte_range=(start_b, end_b), timeout=30.0)
+        for start_b, end_b in ranges
+    ]
+    decoded = _decode_0p1_step_grib(b"".join(chunks), area=area)
+    return {
+        k: decoded[k]
+        for k in OPENDATA_INVARIANT_SFC_PARAMS
+        if k in decoded and np.isfinite(decoded[k].values).any()
+    }
 
 
 def _write_cdm_sfc_daily(
@@ -421,9 +481,20 @@ def _write_cdm_sfc_daily(
                         pass
                 nc_var.setncattr("coordinates", "valid_time")
 
+                fallback_2d = None
+                if vname in OPENDATA_INVARIANT_SFC_PARAMS:
+                    fallback_da = next(
+                        (sd[vname] for sd in step_dicts if vname in sd and np.isfinite(sd[vname].values).any()),
+                        None,
+                    )
+                    if fallback_da is not None:
+                        fallback_2d = np.asarray(fallback_da.values, dtype=np.float32)
+
                 for t_idx, sd in enumerate(step_dicts):
-                    if vname in sd:
+                    if vname in sd and (fallback_2d is None or np.isfinite(sd[vname].values).any()):
                         nc_var[t_idx, 0, :, :] = np.asarray(sd[vname].values, dtype=np.float32)
+                    elif fallback_2d is not None:
+                        nc_var[t_idx, 0, :, :] = fallback_2d
 
         os.replace(tmp_fp, out_path)
     finally:
@@ -470,6 +541,7 @@ def download_opendata_0p1_sfc_daily(
         day_groups.setdefault(valid_dt.strftime("%Y%m%d"), []).append(h)
 
     written: list[Path] = []
+    invariant_cache: dict[str, xr.DataArray] = {}
     for day_str, day_steps in sorted(day_groups.items()):
         out_fp = target_dir / f"ECMWF-IFS-0p1_sfc_{day_str}.nc"
         if not force and _existing_cdm_steps(out_fp) >= len(day_steps):
@@ -503,7 +575,22 @@ def download_opendata_0p1_sfc_daily(
                 sh, sdict = fut.result()
                 step_results[sh] = sdict
 
+        if 0 in step_results:
+            for k in OPENDATA_INVARIANT_SFC_PARAMS:
+                if k in step_results[0] and np.isfinite(step_results[0][k].values).any():
+                    invariant_cache[k] = step_results[0][k]
+
+        if any(k not in invariant_cache for k in OPENDATA_INVARIANT_SFC_PARAMS):
+            fetched_inv = _load_or_fetch_step0_invariants(clean_date, hh, target_dir, area, s3_base_url)
+            for k, da in fetched_inv.items():
+                invariant_cache.setdefault(k, da)
+
         ordered_dicts = [step_results[h] for h in day_steps]
+        for sdict in ordered_dicts:
+            for k, da_inv in invariant_cache.items():
+                if k not in sdict or not np.isfinite(sdict[k].values).any():
+                    sdict[k] = da_inv
+
         _write_cdm_sfc_daily(out_fp, cycle_dt, day_steps, ordered_dicts)
         print(f"[SAVED] {out_fp} ({out_fp.stat().st_size / (1024 ** 2):.2f} MB)")
         written.append(out_fp)

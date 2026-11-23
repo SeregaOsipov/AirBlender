@@ -168,6 +168,47 @@ def _prep_2d_slab(da_2d: xr.DataArray, flip_lat: bool, fill: float = -1.0e30) ->
     return np.nan_to_num(arr, nan=fill).astype(np.float32)
 
 
+def _resolve_static_z_da(
+    ds_sfc: xr.Dataset,
+    sfc_file: Path,
+    sfc_time_dim: str | None,
+) -> xr.DataArray | None:
+    """Resolve finite 2D surface geopotential (`z`/`geopotential`), falling back to sibling 0.1° files."""
+    for zk in ("z", "geopotential"):
+        if zk not in ds_sfc:
+            continue
+        n_steps = ds_sfc.sizes[sfc_time_dim] if (sfc_time_dim and sfc_time_dim in ds_sfc.dims) else 1
+        for idx in range(max(1, n_steps)):
+            ds_t = _select_2d_time(ds_sfc, sfc_time_dim, idx)
+            da = ds_t[zk].squeeze(drop=True)
+            if np.isfinite(da.values).any():
+                return da.load()
+
+    sfc_resolved = sfc_file.resolve()
+    for alt_fp in sorted(sfc_file.parent.glob("ECMWF-IFS-0p1_sfc_*.nc")):
+        if alt_fp.resolve() == sfc_resolved:
+            continue
+        try:
+            with xr.open_dataset(alt_fp) as ds_alt:
+                alt_dim = "forecast_period" if "forecast_period" in ds_alt.dims else ("time" if "time" in ds_alt.dims else None)
+                for zk in ("z", "geopotential"):
+                    if zk not in ds_alt:
+                        continue
+                    da_alt = _select_2d_time(ds_alt, alt_dim, 0)[zk].squeeze(drop=True)
+                    if not np.isfinite(da_alt.values).any():
+                        continue
+                    aligned = da_alt.sel(
+                        latitude=ds_sfc.latitude.values,
+                        longitude=ds_sfc.longitude.values,
+                        method="nearest",
+                    )
+                    if np.isfinite(aligned.values).any():
+                        return aligned.load()
+        except Exception:
+            continue
+    return None
+
+
 def _align_sp_to_ml_grid(ds_sfc_t: xr.Dataset, ds_ml_t: xr.Dataset, flip_lat_ml: bool) -> np.ndarray:
     sp_da = ds_sfc_t.sp.squeeze()
     ml_ny = ds_ml_t.sizes["latitude"]
@@ -271,6 +312,7 @@ def convert_cams_to_wps(
     soil_time_dim, _, soil_time_map = _extract_time_lookup(ds_soil) if ds_soil is not None else (None, [], {})
 
     iter_entries = ml_entries if ml_entries else sfc_entries
+    static_z_da = _resolve_static_z_da(ds_sfc, cams_sfc_file, sfc_time_dim)
 
     generated_files: list[Path] = []
     try:
@@ -335,10 +377,17 @@ def convert_cams_to_wps(
                     pmsl_arr = sp_sfc
                 write_wps_slab(f, {**sfc_meta, "field": "PMSL", "units": "Pa", "xlvl": 201300.0, "slab": pmsl_arr})
 
-                if "z" in ds_sfc_t:
-                    soilhgt_arr = prep_sfc(ds_sfc_t.z) / 9.80665
-                elif "geopotential" in ds_sfc_t:
-                    soilhgt_arr = prep_sfc(ds_sfc_t.geopotential) / 9.80665
+                z_raw = None
+                for zk in ("z", "geopotential"):
+                    if zk in ds_sfc_t:
+                        cand = prep_sfc(ds_sfc_t[zk], fill=np.nan)
+                        if np.isfinite(cand).any():
+                            z_raw = cand
+                            break
+                if z_raw is None and static_z_da is not None:
+                    z_raw = prep_sfc(static_z_da, fill=np.nan)
+                if z_raw is not None:
+                    soilhgt_arr = np.nan_to_num(z_raw / 9.80665, nan=0.0).astype(np.float32)
                 else:
                     soilhgt_arr = np.zeros_like(sp_sfc)
                 write_wps_slab(f, {**sfc_meta, "field": "SOILHGT", "units": "m", "xlvl": 200100.0, "slab": soilhgt_arr})

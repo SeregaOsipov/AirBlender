@@ -871,7 +871,7 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
     print("[Test 7] Multi-grid convert_cams_to_wps (0.1° SFC + 0.4° ML) & airblender.cli cams2icon...")
     from datetime import timezone
     from airblender.cli import main as airblender_main
-    from airblender.fetch.opendata import _write_cdm_sfc_daily
+    from airblender.fetch.opendata import _existing_cdm_steps, _write_cdm_sfc_daily
     from airblender.icon_icbc import prepare_icon_edgar_emissions, prepare_icon_ic, prepare_icon_latbc
 
     with tempfile.TemporaryDirectory(prefix="airblender_mix_") as td:
@@ -889,13 +889,12 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
         lat2d_01, lon2d_01 = np.meshgrid(lats_01, lons_01, indexing="ij")
         lsm_01 = np.where((lon2d_01 >= 50.8) & (lon2d_01 <= 51.6) & (lat2d_01 >= 24.5) & (lat2d_01 <= 26.2), 1.0, 0.0).astype(np.float32)
 
-        def _make_step_dict(temp_k: float) -> dict[str, xr.DataArray]:
+        def _make_step_dict(temp_k: float, include_z: bool = True) -> dict[str, xr.DataArray]:
             coords = {"latitude": lats_01, "longitude": lons_01}
             base = np.ones((len(lats_01), len(lons_01)), dtype=np.float32)
             out = {
                 "sp": xr.DataArray(base * 101200.0, dims=("latitude", "longitude"), coords=coords),
                 "msl": xr.DataArray(base * 101300.0, dims=("latitude", "longitude"), coords=coords),
-                "z": xr.DataArray(lsm_01 * 150.0, dims=("latitude", "longitude"), coords=coords),
                 "lsm": xr.DataArray(lsm_01, dims=("latitude", "longitude"), coords=coords),
                 "skt": xr.DataArray(np.where(lsm_01 > 0.5, temp_k - 3.0, temp_k + 2.0).astype(np.float32), dims=("latitude", "longitude"), coords=coords),
                 "sst": xr.DataArray(np.where(lsm_01 < 0.5, temp_k + 2.0, np.nan).astype(np.float32), dims=("latitude", "longitude"), coords=coords),
@@ -906,6 +905,8 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
                 "sd": xr.DataArray(base * 0.0, dims=("latitude", "longitude"), coords=coords),
                 "siconc": xr.DataArray(base * 0.0, dims=("latitude", "longitude"), coords=coords),
             }
+            if include_z:
+                out["z"] = xr.DataArray(lsm_01 * 150.0, dims=("latitude", "longitude"), coords=coords)
             for i in range(1, 5):
                 out[f"stl{i}"] = xr.DataArray((base * (temp_k - i)).astype(np.float32), dims=("latitude", "longitude"), coords=coords)
                 out[f"swvl{i}"] = xr.DataArray(np.where(lsm_01 > 0.5, 0.14, 0.0).astype(np.float32), dims=("latitude", "longitude"), coords=coords)
@@ -913,9 +914,39 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
 
         cycle_dt = datetime(2026, 11, 22, 0, 0, tzinfo=timezone.utc)
         sfc_01_fp = ifs_dir / "ECMWF-IFS-0p1_sfc_20261122.nc"
-        _write_cdm_sfc_daily(sfc_01_fp, cycle_dt, [0, 3], [_make_step_dict(298.0), _make_step_dict(300.0)])
+        _write_cdm_sfc_daily(
+            sfc_01_fp,
+            cycle_dt,
+            [0, 3],
+            [_make_step_dict(298.0, include_z=True), _make_step_dict(300.0, include_z=False)],
+        )
+        assert _existing_cdm_steps(sfc_01_fp) == 2
+        with Dataset(sfc_01_fp) as dz:
+            z0 = np.ma.filled(dz.variables["z"][0, 0], np.nan)
+            z1 = np.ma.filled(dz.variables["z"][1, 0], np.nan)
+            assert np.all(np.isfinite(z0)) and np.all(np.isfinite(z1))
+            assert float(np.max(z0[lsm_01 > 0.5])) > 100.0
+            assert float(np.max(z1[lsm_01 > 0.5])) > 100.0
 
-        # Build 0.4° CAMS ML dataset (3 levels) + 0.1° GHG dataset
+        bad_nan_fp = root / "bad_nan_z.nc"
+        bad_missing_fp = root / "bad_missing_z.nc"
+        with Dataset(bad_nan_fp, "w") as db:
+            db.createDimension("forecast_period", 2)
+            db.createDimension("latitude", 2)
+            db.createDimension("longitude", 2)
+            vz = db.createVariable("z", "f4", ("forecast_period", "latitude", "longitude"), fill_value=np.float32(np.nan))
+            vz[0] = 100.0
+            vl = db.createVariable("lsm", "f4", ("forecast_period", "latitude", "longitude"))
+            vl[:] = 1.0
+        with Dataset(bad_missing_fp, "w") as db:
+            db.createDimension("forecast_period", 1)
+            db.createDimension("latitude", 2)
+            db.createDimension("longitude", 2)
+            db.createVariable("lsm", "f4", ("forecast_period", "latitude", "longitude"))[:] = 1.0
+        assert _existing_cdm_steps(bad_nan_fp) == 0
+        assert _existing_cdm_steps(bad_missing_fp) == 0
+
+        # Build 0.4° CAMS ML dataset (3 levels) + Day-2 SFC without `z` (tests sibling fallback)
         lats_04 = np.linspace(27.6, 23.6, 11)
         lons_04 = np.linspace(48.8, 53.2, 12)
         pv = np.array([1000.0, 30000.0, 50000.0, 0.0, 0.0, 0.25, 0.65, 1.0], dtype=np.float64)
@@ -923,34 +954,73 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
         frt_sec = int((cycle_dt - epoch).total_seconds())
         vt_secs = np.array([[frt_sec, frt_sec + 10800]], dtype=np.float64)
 
-        cams_ml_fp = cams_dir / "ECMWF-CAMS_ml_20261122.nc"
-        with Dataset(cams_ml_fp, "w") as d:
-            d.createDimension("forecast_period", 2)
-            d.createDimension("forecast_reference_time", 1)
-            d.createDimension("model_level", 3)
-            d.createDimension("latitude", len(lats_04))
-            d.createDimension("longitude", len(lons_04))
-            d.createVariable("forecast_period", "f8", ("forecast_period",))[:] = [0.0, 3.0]
-            d.createVariable("forecast_reference_time", "i8", ("forecast_reference_time",))[:] = [frt_sec]
-            vt = d.createVariable("valid_time", "f8", ("forecast_reference_time", "forecast_period"))
-            vt.units = "seconds since 1970-01-01"
-            vt[:] = vt_secs
-            d.createVariable("model_level", "f8", ("model_level",))[:] = [1, 2, 3]
-            d.createVariable("latitude", "f8", ("latitude",))[:] = lats_04
-            d.createVariable("longitude", "f8", ("longitude",))[:] = lons_04
-            for vname, val in [
-                ("t", 285.0), ("u", 5.0), ("v", -3.0), ("w", 0.01), ("q", 0.008),
-                ("clwc", 0.0), ("ciwc", 0.0), ("aermr04", 1e-8), ("aermr05", 2e-8), ("aermr06", 1e-8),
-                ("so2", 1e-9), ("no2", 2e-9), ("go3", 5e-8), ("co", 1e-7),
-            ]:
-                vv = d.createVariable(vname, "f4", ("forecast_period", "forecast_reference_time", "model_level", "latitude", "longitude"))
-                vv.GRIB_pv = pv
-                vv[:] = val
+        def _write_ml_file(fp: Path, steps_h: list[float], vt_row: list[int]) -> None:
+            with Dataset(fp, "w") as d:
+                d.createDimension("forecast_period", len(steps_h))
+                d.createDimension("forecast_reference_time", 1)
+                d.createDimension("model_level", 3)
+                d.createDimension("latitude", len(lats_04))
+                d.createDimension("longitude", len(lons_04))
+                d.createVariable("forecast_period", "f8", ("forecast_period",))[:] = steps_h
+                d.createVariable("forecast_reference_time", "i8", ("forecast_reference_time",))[:] = [frt_sec]
+                vt = d.createVariable("valid_time", "f8", ("forecast_reference_time", "forecast_period"))
+                vt.units = "seconds since 1970-01-01"
+                vt[:] = np.array([vt_row], dtype=np.float64)
+                d.createVariable("model_level", "f8", ("model_level",))[:] = [1, 2, 3]
+                d.createVariable("latitude", "f8", ("latitude",))[:] = lats_04
+                d.createVariable("longitude", "f8", ("longitude",))[:] = lons_04
+                for vname, val in [
+                    ("t", 285.0), ("u", 5.0), ("v", -3.0), ("w", 0.01), ("q", 0.008),
+                    ("clwc", 0.0), ("ciwc", 0.0), ("aermr04", 1e-8), ("aermr05", 2e-8), ("aermr06", 1e-8),
+                    ("so2", 1e-9), ("no2", 2e-9), ("go3", 5e-8), ("co", 1e-7),
+                ]:
+                    vv = d.createVariable(vname, "f4", ("forecast_period", "forecast_reference_time", "model_level", "latitude", "longitude"))
+                    vv.GRIB_pv = pv
+                    vv[:] = val
 
-        # 7a. Test convert_cams_to_wps across mixed 0.1° SFC + 0.4° ML
+        cams_ml_fp = cams_dir / "ECMWF-CAMS_ml_20261122.nc"
+        _write_ml_file(cams_ml_fp, [0.0, 3.0], [frt_sec, frt_sec + 10800])
+
+        sfc_day2_fp = ifs_dir / "ECMWF-IFS-0p1_sfc_20261123.nc"
+        _write_cdm_sfc_daily(sfc_day2_fp, cycle_dt, [24], [_make_step_dict(299.0, include_z=False)])
+        ml_day2_fp = cams_dir / "ECMWF-CAMS_ml_20261123.nc"
+        _write_ml_file(ml_day2_fp, [24.0], [frt_sec + 86400])
+
+        # 7a. Test convert_cams_to_wps across mixed 0.1° SFC + 0.4° ML (including Day-2 sibling `z` fallback)
         wps_files = convert_cams_to_wps(sfc_01_fp, cams_ml_fp, wps_dir, map_source="ECMWF IFS 0.1+CAMS")
         assert len(wps_files) == 2
         assert (wps_dir / "FILE:2026-11-22_00").is_file() and (wps_dir / "FILE:2026-11-22_03").is_file()
+        wps_day2 = convert_cams_to_wps(sfc_day2_fp, ml_day2_fp, wps_dir, map_source="ECMWF IFS 0.1+CAMS")
+        assert len(wps_day2) == 1 and (wps_dir / "FILE:2026-11-23_00").is_file()
+
+        def _read_wps_field(fp: Path, target_field: str) -> np.ndarray:
+            import struct
+            with open(fp, "rb") as fh:
+                while True:
+                    hdr = fh.read(4)
+                    if not hdr:
+                        raise KeyError(target_field)
+                    rec1_len = struct.unpack(">i", hdr)[0]
+                    assert rec1_len == 4
+                    fh.read(rec1_len + 4)  # version + trailing len
+                    r2_len = struct.unpack(">i", fh.read(4))[0]
+                    rec2 = fh.read(r2_len)
+                    fh.read(4)
+                    field_name = struct.unpack(">24sf32s9s25s46sfiii", rec2)[3].decode("ascii").strip()
+                    nx, ny = struct.unpack(">24sf32s9s25s46sfiii", rec2)[7:9]
+                    r3_len = struct.unpack(">i", fh.read(4))[0]
+                    fh.read(r3_len + 4)
+                    r4_len = struct.unpack(">i", fh.read(4))[0]
+                    fh.read(r4_len + 4)
+                    r5_len = struct.unpack(">i", fh.read(4))[0]
+                    slab_bytes = fh.read(r5_len)
+                    fh.read(4)
+                    if field_name == target_field:
+                        return np.frombuffer(slab_bytes, dtype=">f4").reshape(ny, nx).astype(np.float32)
+
+        soilhgt_d2 = _read_wps_field(wps_dir / "FILE:2026-11-23_00", "SOILHGT")
+        assert np.all(np.isfinite(soilhgt_d2))
+        assert float(np.min(soilhgt_d2)) >= 0.0 and float(np.max(soilhgt_d2)) > 10.0, soilhgt_d2.max()
 
         # 7b. Test ICON-ART IC + LatBC + CLI `cams2icon` on mixed 0.1° SFC + 0.4° ML
         grid_fp = root / "domain.nc"
@@ -1005,6 +1075,20 @@ def test_mixed_grid_wps_and_cams2icon() -> None:
         assert (icon_run / "ART_ICE_iconR2B09-grid_TCNR.nc").is_file()
         assert (icon_run / "latbc" / "lbc_20261122T000000Z.nc").is_file()
         assert (icon_run / "latbc" / "lbc_20261122T030000Z.nc").is_file()
+
+        # 7c. Day-2 ICON LatBC fallback when Day-2 SFC file lacks `z`
+        lbc_day2 = prepare_icon_latbc(
+            cams_dir=cams_dir,
+            latbc_grid_path=lbc_grid_fp,
+            run_dir=icon_run,
+            times=[datetime(2026, 11, 23, 0, 0, tzinfo=timezone.utc)],
+            met_sfc_dir=ifs_dir,
+            met_sfc_prefix="ECMWF-IFS-0p1_sfc",
+        )
+        assert len(lbc_day2) == 1 and lbc_day2[0].is_file()
+        with Dataset(lbc_day2[0]) as dl:
+            geosp = np.asarray(dl.variables["GEOSP"][0, :])
+            assert float(geosp[1]) > 100.0 and float(geosp[2]) > 100.0, f"Expected GEOSP > 100 over land, got {geosp}"
     print("  -> Test 7 PASSED.")
 
 

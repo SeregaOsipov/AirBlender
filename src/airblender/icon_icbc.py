@@ -266,6 +266,40 @@ def _read_surface_var_any(ds: nc.Dataset, names: Sequence[str], idx: tuple[int, 
     raise KeyError(f"None of {names} found in {getattr(ds, 'filepath', lambda: '<ds>')()}")
 
 
+def _read_orog_z_2d(
+    ds_met_sfc: nc.Dataset,
+    idx_met_sfc: tuple[int, ...],
+    sfc_dir: Path,
+    met_sfc_prefix: str,
+) -> np.ndarray | None:
+    """Read surface geopotential `z`, falling back to step 0 or sibling files when absent at t>0."""
+    if "z" in ds_met_sfc.variables:
+        arr = _read_cams_var(ds_met_sfc, "z", idx_met_sfc, fill=np.nan)
+        if np.isfinite(arr).any():
+            return np.nan_to_num(arr, nan=0.0)
+        if idx_met_sfc:
+            arr0 = _read_cams_var(ds_met_sfc, "z", (0,) * len(idx_met_sfc), fill=np.nan)
+            if np.isfinite(arr0).any():
+                return np.nan_to_num(arr0, nan=0.0)
+
+    sp_var = ds_met_sfc.variables.get("sp")
+    expected_shape = sp_var.shape[-2:] if sp_var is not None else None
+    for alt_path in sorted(sfc_dir.glob(f"{met_sfc_prefix}_*.nc")):
+        try:
+            with nc.Dataset(alt_path, "r") as ds_alt:
+                if "z" not in ds_alt.variables:
+                    continue
+                vz = ds_alt.variables["z"]
+                if expected_shape is not None and vz.shape[-2:] != expected_shape:
+                    continue
+                arr_alt = _read_cams_var(ds_alt, "z", (0,) * max(0, vz.ndim - 2), fill=np.nan)
+                if np.isfinite(arr_alt).any():
+                    return np.nan_to_num(arr_alt, nan=0.0)
+        except Exception:
+            continue
+    return None
+
+
 def _compute_cams_heights(
     sp: np.ndarray,
     z_sfc: np.ndarray,
@@ -537,11 +571,8 @@ def prepare_icon_ic(
         )
 
         sp = w_met_sfc.interp(_read_cams_var(ds_met_sfc, "sp", idx_met_sfc))
-        z_sfc = (
-            w_met_sfc.interp(_read_cams_var(ds_met_sfc, "z", idx_met_sfc))
-            if "z" in ds_met_sfc.variables
-            else np.zeros(n_c, dtype=np.float64)
-        )
+        z_sfc_2d = _read_orog_z_2d(ds_met_sfc, idx_met_sfc, sfc_dir, met_sfc_prefix)
+        z_sfc = w_met_sfc.interp(z_sfc_2d) if z_sfc_2d is not None else np.zeros(n_c, dtype=np.float64)
 
         # Separate land and sea pixels before interpolation to eliminate coastal contamination
         sfc_lsm_src = (
@@ -856,6 +887,7 @@ def prepare_icon_latbc(
     w_chem_ml: _BilinearWeights | None = None
     w_ghg: _BilinearWeights | None = None
     same_ml_as_chem = ml_dir.resolve() == cams_dir.resolve() and met_ml_prefix == "ECMWF-CAMS_ml"
+    z_sfc_cached: np.ndarray | None = None
     written: list[Path] = []
 
     for dt in times:
@@ -916,11 +948,11 @@ def prepare_icon_latbc(
             n_ml = nhyi - 1
 
             sp = w_met_sfc.interp(_read_cams_var(ds_met_sfc, "sp", idx_met_sfc))
-            z_sfc = (
-                w_met_sfc.interp(_read_cams_var(ds_met_sfc, "z", idx_met_sfc))
-                if "z" in ds_met_sfc.variables
-                else np.zeros(geom["n_cells"], dtype=np.float64)
-            )
+            if z_sfc_cached is None:
+                z_sfc_2d = _read_orog_z_2d(ds_met_sfc, idx_met_sfc, sfc_dir, met_sfc_prefix)
+                if z_sfc_2d is not None:
+                    z_sfc_cached = w_met_sfc.interp(z_sfc_2d)
+            z_sfc = z_sfc_cached if z_sfc_cached is not None else np.zeros(geom["n_cells"], dtype=np.float64)
 
             t_met = w_met_ml.interp(_read_cams_var(ds_met_ml, "t", idx_met_ml, fill=250.0))
             q_met = np.maximum(w_met_ml.interp(_read_cams_var(ds_met_ml, "q", idx_met_ml)), 0.0)
