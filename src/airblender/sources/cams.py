@@ -6,9 +6,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import interpolate
 import xarray as xr
 
+from airblender.regrid.wrf_regrid import hor_interpolate_array_on_points
 from airblender.sources.base import DateDonorContext, DonorAdapter, ensure_ascending_lat_lon
 
 
@@ -153,12 +153,15 @@ class CamsDonorAdapter(DonorAdapter):
         b_mid = 0.5 * (b[:-1] + b[1:])
 
         sp_vals = donor_sfc_ds["sp"].transpose("lat", "lon").values
-        f_sp = interpolate.RectBivariateSpline(donor_sfc_ds.lat, donor_sfc_ds.lon, sp_vals)
         if is_boundary:
-            sp_target = np.asarray(
-                f_sp(wrf_target_ds.boundary_lats, wrf_target_ds.boundary_lons, grid=False),
-                dtype=np.float64,
-            ).reshape(-1)
+            sp_target = hor_interpolate_array_on_points(
+                sp_vals,
+                donor_sfc_ds.lat.values,
+                donor_sfc_ds.lon.values,
+                wrf_target_ds.boundary_lats.values,
+                wrf_target_ds.boundary_lons.values,
+                out_shape=(wrf_target_ds.boundary_points.size,),
+            )
             p_rho = a_mid[:, None] + b_mid[:, None] * sp_target[None, :]
             return xr.DataArray(
                 p_rho, dims=["level", "boundary_points"], coords={"level": donor_stream_ds.level}
@@ -166,10 +169,14 @@ class CamsDonorAdapter(DonorAdapter):
 
         ny = wrf_target_ds.south_north.size
         nx = wrf_target_ds.west_east.size
-        sp_target = np.asarray(
-            f_sp(wrf_target_ds.XLAT, wrf_target_ds.XLONG, grid=False),
-            dtype=np.float64,
-        ).reshape(ny, nx)
+        sp_target = hor_interpolate_array_on_points(
+            sp_vals,
+            donor_sfc_ds.lat.values,
+            donor_sfc_ds.lon.values,
+            wrf_target_ds.XLAT.values,
+            wrf_target_ds.XLONG.values,
+            out_shape=(ny, nx),
+        )
         p_rho = a_mid[:, None, None] + b_mid[:, None, None] * sp_target[None, :, :]
         return xr.DataArray(
             p_rho, dims=["level", "south_north", "west_east"], coords={"level": donor_stream_ds.level}

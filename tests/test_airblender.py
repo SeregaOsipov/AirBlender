@@ -1167,6 +1167,79 @@ def test_cams_error_classification_and_circuit_breaker() -> None:
     print("  -> Test 8 PASSED.")
 
 
+def test_vectorized_wrf_regrid_and_bilinear_cache() -> None:
+    print("[Test 9] Vectorized WRF vertical regrid & cached non-negative bilinear horizontal regrid...")
+    from airblender.regrid.wrf_regrid import (
+        _HORIZ_WEIGHT_CACHE,
+        _VERT_PLAN_CACHE,
+        _interp_2d_spline_levels,
+        _ver_interpolate_edge_clamped,
+    )
+
+    rng = np.random.default_rng(42)
+    ny, nx = 6, 7
+    k_src, k_dst = 12, 9
+    # Test ascending, descending, and non-monotonic donor pressure orderings vs np.interp
+    for mode in ("asc", "desc", "nonmono"):
+        p_base = np.linspace(1000.0, 100000.0, k_src)[:, None, None] + rng.uniform(-100.0, 100.0, (k_src, ny, nx))
+        p_base = np.maximum.accumulate(p_base, axis=0)
+        if mode == "desc":
+            p_vals = p_base[::-1].copy()
+        elif mode == "nonmono":
+            p_vals = p_base.copy()
+            p_vals[3], p_vals[4] = p_vals[4].copy(), p_vals[3].copy()
+        else:
+            p_vals = p_base
+        v_vals = rng.uniform(0.0, 10.0, (k_src, ny, nx))
+        # Target WRF pressures include below-top (<1000) and below-surface (>100000) clamping
+        p_wrf_vals = np.linspace(500.0, 103000.0, k_dst)[:, None, None] * np.ones((1, ny, nx))
+
+        da_v = xr.DataArray(v_vals, dims=("level", "south_north", "west_east"))
+        da_pdon = xr.DataArray(p_vals, dims=("level", "south_north", "west_east"))
+        da_pwrf = xr.DataArray(p_wrf_vals, dims=("bottom_top", "south_north", "west_east"))
+
+        _VERT_PLAN_CACHE.clear()
+        got1 = _ver_interpolate_edge_clamped(da_v, da_pdon, da_pwrf).values
+        got2 = _ver_interpolate_edge_clamped(da_v * 2.0, da_pdon, da_pwrf).values
+        assert len(_VERT_PLAN_CACHE) == 1
+
+        ref = np.empty_like(got1)
+        for iy in range(ny):
+            for ix in range(nx):
+                xp = p_vals[:, iy, ix]
+                fp = v_vals[:, iy, ix]
+                order = np.argsort(xp)
+                ref[:, iy, ix] = np.interp(p_wrf_vals[:, iy, ix], xp[order], fp[order])
+        assert np.allclose(got1, ref, atol=1e-10, rtol=1e-12), f"Mismatch in mode={mode}: maxdiff={np.max(np.abs(got1 - ref))}"
+        assert np.allclose(got2, 2.0 * ref, atol=1e-10, rtol=1e-12)
+
+    # Sharp step plume: cubic spline undershoots < 0 while bilinear stays strictly >= 0 and reuses cache
+    src_lats = np.linspace(23.0, 27.0, 11)
+    src_lons = np.linspace(49.0, 53.0, 11)
+    step_2d = np.where((src_lats[:, None] >= 24.6) & (src_lons[None, :] >= 50.6), 100.0, 0.0)
+    da_step = xr.DataArray(
+        np.broadcast_to(step_2d[None, :, :], (4, 11, 11)).copy(),
+        dims=("level", "lat", "lon"),
+        coords={"level": [1, 2, 3, 4], "lat": src_lats, "lon": src_lons},
+    )
+    t_lat, t_lon = np.meshgrid(np.linspace(23.5, 26.5, 25), np.linspace(49.5, 52.5, 27), indexing="ij")
+    da_lat = xr.DataArray(t_lat, dims=("south_north", "west_east"))
+    da_lon = xr.DataArray(t_lon, dims=("south_north", "west_east"))
+
+    out_spline = _interp_2d_spline_levels(da_step, da_lat, da_lon, t_lat.shape, ("level", "south_north", "west_east"), method="spline").values
+    assert float(out_spline.min()) < -0.5, f"Expected cubic spline negative undershoot, got min={out_spline.min()}"
+
+    _HORIZ_WEIGHT_CACHE.clear()
+    out_bilin1 = _interp_2d_spline_levels(da_step, da_lat, da_lon, t_lat.shape, ("level", "south_north", "west_east"), method="bilinear").values
+    cache_len = len(_HORIZ_WEIGHT_CACHE)
+    assert cache_len == 1
+    out_bilin2 = _interp_2d_spline_levels(da_step, da_lat, da_lon, t_lat.shape, ("level", "south_north", "west_east"), method="bilinear").values
+    assert len(_HORIZ_WEIGHT_CACHE) == 1
+    assert float(out_bilin1.min()) >= 0.0, f"Bilinear should be non-negative, got {out_bilin1.min()}"
+    assert np.allclose(out_bilin1, out_bilin2)
+    print("  -> Test 9 PASSED.")
+
+
 def main() -> None:
     print("=" * 68)
     print(" Running AirBlender Verification Suite")
@@ -1179,6 +1252,7 @@ def main() -> None:
     test_dynamics_resolver_and_fallback()
     test_mixed_grid_wps_and_cams2icon()
     test_cams_error_classification_and_circuit_breaker()
+    test_vectorized_wrf_regrid_and_bilinear_cache()
     print("=" * 68)
     print(" ALL AIRBLENDER CHECKS PASSED (100% OK)")
     print("=" * 68)

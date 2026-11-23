@@ -1,9 +1,103 @@
 """Horizontal spline interpolation, edge-clamped vertical pressure interpolation, and WRF boundary writers."""
 from __future__ import annotations
 
+import os
+from typing import Any
+
 import numpy as np
 from scipy import interpolate
 import xarray as xr
+
+from airblender.icon_icbc import _BilinearWeights
+
+_HORIZ_WEIGHT_CACHE: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, _BilinearWeights]] = []
+_MAX_HORIZ_CACHE = 16
+# Cache entries: (p_don, p_wrf, order_mode, sort_idx, idx_lo, idx_hi, alpha)
+_VERT_PLAN_CACHE: list[tuple[np.ndarray, np.ndarray, str, np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]] = []
+_MAX_VERT_CACHE = 4
+
+
+def _get_cached_bilinear_weights(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    target_lats_1d: np.ndarray,
+    target_lons_1d: np.ndarray,
+) -> _BilinearWeights:
+    """Return cached `_BilinearWeights` for matching 1D donor coordinates and flattened target points."""
+    for i, (c_lats, c_lons, c_tlat, c_tlon, weights) in enumerate(_HORIZ_WEIGHT_CACHE):
+        if (
+            c_lats.shape == lats.shape
+            and c_lons.shape == lons.shape
+            and c_tlat.shape == target_lats_1d.shape
+            and c_tlon.shape == target_lons_1d.shape
+            and c_lats[0] == lats[0]
+            and c_lats[-1] == lats[-1]
+            and c_lons[0] == lons[0]
+            and c_lons[-1] == lons[-1]
+            and c_tlat[0] == target_lats_1d[0]
+            and c_tlat[-1] == target_lats_1d[-1]
+            and c_tlon[0] == target_lons_1d[0]
+            and c_tlon[-1] == target_lons_1d[-1]
+            and np.array_equal(c_lats, lats)
+            and np.array_equal(c_lons, lons)
+            and np.array_equal(c_tlat, target_lats_1d)
+            and np.array_equal(c_tlon, target_lons_1d)
+        ):
+            _HORIZ_WEIGHT_CACHE.append(_HORIZ_WEIGHT_CACHE.pop(i))
+            return weights
+
+    weights = _BilinearWeights.build(lats, lons, target_lats_1d, target_lons_1d)
+    _HORIZ_WEIGHT_CACHE.append(
+        (lats.copy(), lons.copy(), target_lats_1d.copy(), target_lons_1d.copy(), weights)
+    )
+    if len(_HORIZ_WEIGHT_CACHE) > _MAX_HORIZ_CACHE:
+        _HORIZ_WEIGHT_CACHE.pop(0)
+    return weights
+
+
+def hor_interpolate_array_on_points(
+    vals: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    target_lats: np.ndarray,
+    target_lons: np.ndarray,
+    out_shape: tuple[int, ...],
+    method: str | None = None,
+) -> np.ndarray:
+    """Interpolate a 2D `(lat, lon)` or 3D `(level, lat, lon)` array onto target coordinates."""
+    interp_method = (method or os.environ.get("AIRBLENDER_WRF_HORIZ_INTERP", "bilinear")).strip().lower()
+    if interp_method not in ("bilinear", "spline"):
+        raise ValueError(f"Unsupported horizontal interpolation method: {interp_method!r}")
+
+    lats_arr = np.asarray(lats, dtype=np.float64)
+    lons_arr = np.asarray(lons, dtype=np.float64)
+    vals_arr = np.asarray(vals, dtype=np.float64)
+    is_2d = vals_arr.ndim == 2
+    if is_2d:
+        vals_arr = vals_arr[None, :, :]
+
+    if lats_arr.size > 1 and lats_arr[0] > lats_arr[-1]:
+        vals_arr = vals_arr[:, ::-1, :]
+        lats_arr = lats_arr[::-1]
+    if lons_arr.size > 1 and lons_arr[0] > lons_arr[-1]:
+        vals_arr = vals_arr[:, :, ::-1]
+        lons_arr = lons_arr[::-1]
+
+    t_lat = np.asarray(target_lats, dtype=np.float64)
+    t_lon = np.asarray(target_lons, dtype=np.float64)
+
+    if interp_method == "bilinear" and lats_arr.size >= 2 and lons_arr.size >= 2:
+        weights = _get_cached_bilinear_weights(lats_arr, lons_arr, t_lat.ravel(), t_lon.ravel())
+        out = weights.interp(vals_arr).reshape((vals_arr.shape[0],) + out_shape)
+        return out[0] if is_2d else out
+
+    n_lev = vals_arr.shape[0]
+    data = np.zeros((n_lev,) + out_shape, dtype=np.float64)
+    for k in range(n_lev):
+        spline = interpolate.RectBivariateSpline(lats_arr, lons_arr, vals_arr[k])
+        res = spline(t_lat, t_lon, grid=False)
+        data[k] = res.reshape(out_shape) if res.shape != out_shape else res
+    return data[0] if is_2d else data
 
 
 def _interp_2d_spline_levels(
@@ -12,27 +106,19 @@ def _interp_2d_spline_levels(
     target_lons: np.ndarray,
     out_shape: tuple[int, ...],
     out_dims: tuple[str, ...],
+    method: str | None = None,
 ) -> xr.DataArray:
-    """Shared level-by-level `RectBivariateSpline` interpolator for WRF interiors and boundaries."""
-    lats = np.asarray(donor_var_da.lat.values, dtype=np.float64)
-    lons = np.asarray(donor_var_da.lon.values, dtype=np.float64)
-    if lats.size > 1 and lats[0] > lats[-1]:
-        donor_var_da = donor_var_da.isel(lat=slice(None, None, -1))
-        lats = lats[::-1]
-    if lons.size > 1 and lons[0] > lons[-1]:
-        donor_var_da = donor_var_da.isel(lon=slice(None, None, -1))
-        lons = lons[::-1]
-
-    n_lev = donor_var_da.level.size
-    data = np.zeros((n_lev,) + out_shape, dtype=np.float64)
-    t_lat = np.asarray(target_lats)
-    t_lon = np.asarray(target_lons)
+    """Shared level-by-level horizontal interpolator (cached bilinear by default, or `spline`)."""
     vals = np.asarray(donor_var_da.transpose("level", "lat", "lon").values, dtype=np.float64)
-    for k in range(n_lev):
-        spline = interpolate.RectBivariateSpline(lats, lons, vals[k])
-        res = spline(t_lat, t_lon, grid=False)
-        data[k] = res.reshape(out_shape) if res.shape != out_shape else res
-
+    data = hor_interpolate_array_on_points(
+        vals,
+        donor_var_da.lat.values,
+        donor_var_da.lon.values,
+        target_lats,
+        target_lons,
+        out_shape,
+        method=method,
+    )
     return xr.DataArray(data=data, dims=list(out_dims), coords={"level": donor_var_da.level})
 
 
@@ -58,12 +144,74 @@ def hor_interpolate_3d_field_on_wrf_grid(donor_var_da: xr.DataArray, wrf_grid_ds
     )
 
 
+def _build_or_get_vert_plan(
+    p_don: np.ndarray,
+    p_wrf: np.ndarray,
+) -> tuple[str, np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute or retrieve vectorized linear vertical-interpolation indices and weights."""
+    k_src, n_col = p_don.shape
+    k_dst = p_wrf.shape[0]
+    p_don_00 = float(p_don[0, 0]) if p_don.size else 0.0
+    p_don_11 = float(p_don[-1, -1]) if p_don.size else 0.0
+    p_wrf_00 = float(p_wrf[0, 0]) if p_wrf.size else 0.0
+    p_wrf_11 = float(p_wrf[-1, -1]) if p_wrf.size else 0.0
+
+    for i, (c_pdon, c_pwrf, order_mode, sort_idx, idx_lo, idx_hi, alpha) in enumerate(_VERT_PLAN_CACHE):
+        if (
+            c_pdon.shape == p_don.shape
+            and c_pwrf.shape == p_wrf.shape
+            and (float(c_pdon[0, 0]) if c_pdon.size else 0.0) == p_don_00
+            and (float(c_pdon[-1, -1]) if c_pdon.size else 0.0) == p_don_11
+            and (float(c_pwrf[0, 0]) if c_pwrf.size else 0.0) == p_wrf_00
+            and (float(c_pwrf[-1, -1]) if c_pwrf.size else 0.0) == p_wrf_11
+            and np.array_equal(c_pdon, p_don)
+            and np.array_equal(c_pwrf, p_wrf)
+        ):
+            _VERT_PLAN_CACHE.append(_VERT_PLAN_CACHE.pop(i))
+            return order_mode, sort_idx, idx_lo, idx_hi, alpha
+
+    sort_idx: np.ndarray | None = None
+    if k_src <= 1 or np.all(np.diff(p_don, axis=0) >= 0.0):
+        order_mode = "asc"
+        p_don_asc = p_don
+    elif p_don[0, 0] > p_don[-1, 0] and np.all(np.diff(p_don[::-1], axis=0) >= 0.0):
+        order_mode = "desc"
+        p_don_asc = p_don[::-1]
+    else:
+        order_mode = "sort"
+        sort_idx = np.argsort(p_don, axis=0)
+        p_don_asc = np.take_along_axis(p_don, sort_idx, axis=0)
+
+    idx_lo = np.empty((k_dst, n_col), dtype=np.int32)
+    idx_hi = np.empty((k_dst, n_col), dtype=np.int32)
+    alpha = np.empty((k_dst, n_col), dtype=np.float64)
+
+    chunk_cols = 2048
+    for c0 in range(0, n_col, chunk_cols):
+        c1 = min(n_col, c0 + chunk_cols)
+        hi = np.sum(p_don_asc[None, :, c0:c1] <= p_wrf[:, None, c0:c1], axis=1, dtype=np.int32)
+        c_hi = np.clip(hi, 0, k_src - 1)
+        c_lo = np.clip(hi - 1, 0, k_src - 1)
+        p0 = np.take_along_axis(p_don_asc[:, c0:c1], c_lo, axis=0)
+        p1 = np.take_along_axis(p_don_asc[:, c0:c1], c_hi, axis=0)
+        denom = p1 - p0
+        w = np.where(denom > 0.0, (p_wrf[:, c0:c1] - p0) / np.where(denom > 0.0, denom, 1.0), 0.0)
+        idx_lo[:, c0:c1] = c_lo
+        idx_hi[:, c0:c1] = c_hi
+        alpha[:, c0:c1] = np.clip(w, 0.0, 1.0)
+
+    _VERT_PLAN_CACHE.append((p_don.copy(), p_wrf.copy(), order_mode, sort_idx, idx_lo, idx_hi, alpha))
+    if len(_VERT_PLAN_CACHE) > _MAX_VERT_CACHE:
+        _VERT_PLAN_CACHE.pop(0)
+    return order_mode, sort_idx, idx_lo, idx_hi, alpha
+
+
 def _ver_interpolate_edge_clamped(
     donor_var_da: xr.DataArray, donor_p_rho_da: xr.DataArray, wrf_p_rho_da: xr.DataArray
 ) -> xr.DataArray:
     """
-    Linearly interpolate 3D or boundary-unraveled donor columns onto WRF pressure
-    levels with boundary clamping (`np.interp` edge clamp outside donor pressure bounds).
+    Vectorized linear interpolation of 3D or boundary donor columns onto WRF pressure
+    levels with boundary clamping (matching `np.interp` edge clamp outside donor bounds).
     """
     donor_vdim = "level" if "level" in donor_var_da.dims else donor_var_da.dims[0]
     wrf_vdim = "bottom_top" if "bottom_top" in wrf_p_rho_da.dims else wrf_p_rho_da.dims[0]
@@ -77,18 +225,18 @@ def _ver_interpolate_edge_clamped(
     p_don = np.asarray(donor_p_bt.values, dtype=np.float64).reshape(donor_p_bt.shape[0], -1)
     v_don = np.asarray(donor_v_bt.values, dtype=np.float64).reshape(donor_v_bt.shape[0], -1)
 
-    out = np.empty_like(p_wrf)
-    for col in range(p_wrf.shape[1]):
-        xp = p_don[:, col]
-        fp = v_don[:, col]
-        if xp[0] > xp[-1]:
-            xp = xp[::-1]
-            fp = fp[::-1]
-        elif not np.all(np.diff(xp) >= 0):
-            order = np.argsort(xp)
-            xp = xp[order]
-            fp = fp[order]
-        out[:, col] = np.interp(p_wrf[:, col], xp, fp)
+    order_mode, sort_idx, idx_lo, idx_hi, alpha = _build_or_get_vert_plan(p_don, p_wrf)
+    if order_mode == "asc":
+        v_asc = v_don
+    elif order_mode == "desc":
+        v_asc = v_don[::-1]
+    else:
+        assert sort_idx is not None
+        v_asc = np.take_along_axis(v_don, sort_idx, axis=0)
+
+    v0 = np.take_along_axis(v_asc, idx_lo, axis=0)
+    v1 = np.take_along_axis(v_asc, idx_hi, axis=0)
+    out = v0 + alpha * (v1 - v0)
 
     return (
         xr.DataArray(out.reshape(wrf_p_bt.shape), dims=wrf_p_bt.dims, coords=wrf_p_bt.coords)
