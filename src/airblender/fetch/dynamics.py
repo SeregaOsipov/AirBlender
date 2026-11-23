@@ -18,6 +18,7 @@ from airblender.fetch.opendata import (
 
 
 SUPPORTED_PROVIDERS = ("ifs_mars_9km", "ifs_0p1_sfc_cams_ml", "cams_0p4_ml")
+_MARS_PROBE_CACHE: dict[tuple[str, str, str], tuple[bool, str]] = {}
 
 
 @dataclass
@@ -134,16 +135,31 @@ def resolve_and_fetch_dynamics(
 
         if candidate == "ifs_mars_9km":
             try:
-                ok, reason = probe_ifs_mars_access(
-                    cycle_date,
-                    ifs_type=str(mars_cfg.get("type", "fc")),
-                    time_str=time_str,
-                    max_step_h=max_step_h,
-                    area=area,
-                    grid=mars_grid,
-                    rc_file=mars_rc,
-                    timeout_sec=mars_probe_timeout,
-                )
+                mars_type = str(mars_cfg.get("type", "fc"))
+                cache_key = (cycle_date.replace("-", "")[:8], mars_type.lower(), mars_grid)
+                cached_probe = None if force else _MARS_PROBE_CACHE.get(cache_key)
+                if cached_probe is not None:
+                    ok, reason = cached_probe
+                    if not ok:
+                        fallback_reasons[candidate] = reason
+                        attempts.append({"provider": candidate, "status": "unavailable", "reason": reason})
+                        if strict_mode:
+                            raise RuntimeError(f"Pinned dynamics provider '{candidate}' unavailable: {reason}")
+                        print(f"[Dynamics-Fallback] Reusing cached MARS probe result ({reason}); checking next fallback...", flush=True)
+                        continue
+                else:
+                    ok, reason = probe_ifs_mars_access(
+                        cycle_date,
+                        ifs_type=mars_type,
+                        time_str=time_str,
+                        max_step_h=max_step_h,
+                        area=area,
+                        grid=mars_grid,
+                        rc_file=mars_rc,
+                        timeout_sec=mars_probe_timeout,
+                    )
+                    if not ok:
+                        _MARS_PROBE_CACHE[cache_key] = (False, reason)
                 if not ok:
                     fallback_reasons[candidate] = reason
                     attempts.append({"provider": candidate, "status": "unavailable", "reason": reason})

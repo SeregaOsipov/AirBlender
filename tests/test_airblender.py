@@ -842,6 +842,28 @@ def test_dynamics_resolver_and_fallback() -> None:
             assert ok_mir, f"Expected mirror failover success, got: {reason_mir}"
             assert len(calls_urls) == 2
             assert calls_urls[0].split("/20261122")[0] != calls_urls[1].split("/20261122")[0]
+
+        # 6g. Negative MARS probe result is cached per (cycle_date, type, grid) within process
+        from airblender.fetch.dynamics import _MARS_PROBE_CACHE
+        _MARS_PROBE_CACHE.pop(("20261120", "fc", "0.08/0.08"), None)
+        with (
+            patch("airblender.fetch.dynamics.probe_ifs_mars_access", return_value=(False, "MARS timed out")) as mock_probe_cache,
+            patch("airblender.fetch.dynamics.probe_opendata_0p1", return_value=(False, "skip")),
+        ):
+            r1 = resolve_and_fetch_dynamics(
+                "2026-11-20",
+                cams_dir=cams_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km"},
+                leadtimes_hours=[0, 3],
+            )
+            r2 = resolve_and_fetch_dynamics(
+                "2026-11-20",
+                cams_dir=cams_dir,
+                dynamics_cfg={"mode": "auto", "primary": "ifs_mars_9km"},
+                leadtimes_hours=[0, 3],
+            )
+            assert r1.provider == "cams_0p4_ml" and r2.provider == "cams_0p4_ml"
+            assert mock_probe_cache.call_count == 1, f"Expected cached probe reuse, got {mock_probe_cache.call_count} calls"
     print("  -> Test 6 PASSED.")
 
 
