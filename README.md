@@ -12,7 +12,7 @@ It is a standalone, `pip`-installable Python package.
 
 | Subcommand / Entry Point | Source $\rightarrow$ Target | Scope & Highlights |
 | :--- | :--- | :--- |
-| **`cams2wrf`** (`airblender.wrf_icbc`) | ECMWF CAMS $\rightarrow$ WRF-Chem | Reactive trace gases covering both **RACM (`chem_opt=100`)** and **RADM2 (`chem_opt=106`)** (`c2h4` mapped to both `ete` and `ol2`, plus `macr <- 0.413*[ispd]`, `op1 <- 0.603*[ch3ooh]`, `aco3 <- 0.386*[c2o3]`), `MADE/SORGAM + GOCART` aerosols (including CAMS Cy49r1 `aermr01` `0.03–0.5 µm` with pre-`2026-05-12` `0.03–0.55 µm` fallback), and mixed-grid `0.1°` CAMS GHG (`co2`, `ch4` with `ml` `ch4_c` fallback). Supports multiple nested `wrfinput_d0*` + `wrfbdy_d01` with edge-clamped vertical pressure interpolation and identical-step BC reuse. |
+| **`cams2wrf`** (`airblender.wrf_icbc`) | ECMWF CAMS $\rightarrow$ WRF-Chem | Reactive trace gases covering both **RACM (`chem_opt=100`)** and **RADM2 (`chem_opt=106`)** (`c2h4` mapped to both `ete` and `ol2`, plus `macr <- 0.413*[ispd]`, `op1 <- 0.603*[ch3ooh]`, `aco3 <- 0.386*[c2o3]`), `MADE/SORGAM + GOCART` aerosols (including CAMS Cy49r1 `aermr01` `0.03–0.5 µm` with pre-`2026-05-12` `0.03–0.55 µm` fallback), and mixed-grid `0.1°` CAMS GHG (`co2`, `ch4` with `ml` `ch4_c` fallback). Supports multiple nested `wrfinput_d0*` + `wrfbdy_d01` using vectorized log-P vertical plans (`_build_or_get_vert_plan`, `_ver_interpolate_edge_clamped`, monotone non-negative profiles eliminating cubic-spline undershoots) and cached bilinear horizontal weights (`_get_cached_bilinear_weights`, `hor_interpolate_array_on_points`), delivering a **4.12x `cams2wrf` speedup** (`540.6s -> 131.3s`) with identical-step BC reuse. |
 | **`merra2wrf`** (`airblender.wrf_icbc`) | NASA MERRA-2 $\rightarrow$ WRF-Chem | `PL` + `DELP` fallback hybrid pressure reconstruction, `VVV` naming support, selectable WRF schemes (`made_sorgam`, `gocart`, `gocart_dust`, `mosaic_8bin`), full `CAMS2WRF` parity (stream caching + BC array reuse). |
 | **`emac2wrf`** (`airblender.wrf_icbc`) | EMAC / MESSy $\rightarrow$ WRF-Chem | Log-normal 4-mode (`ns, ks, as, cs`) $\rightarrow$ MADE/SORGAM 3-mode (`nu0/ai`, `ac0/aj`, `corn`) moment mapping, `[0, 360) -> [-180, 180)` longitude shifting, glob restart handling, and strict DSL syntax checking (including fixed `2.01*[SS_cs]` rule). |
 | **`cams2wps`** (`airblender.cams2wps`) | ECMWF IFS / CAMS $\rightarrow$ WPS | Direct Fortran unformatted WPS v5 intermediate generator (`FILE:YYYY-MM-DD_HH`) supporting independent mixed-resolution `sfc` (`0.08°` MARS IFS, `0.1°` OpenData S3, or `0.4°` CAMS) + 137-level `ml` (`0.08°` or `0.4°`) NetCDFs, exact UTC slice lookup, coastal land/sea mask infill (`_infill_2d_by_mask`), Tetens 2 m `d2m -> SPECHUMD`, 4-layer soil (`stl1..4`, `swvl1..4`, or external OpenData soil NetCDF), `sp` alignment onto the `ml` grid, `GRIB_pv` `(a_k, b_k)` midpoint pressures, atomic `.tmp` writes, and up-to-date slice skipping. |
@@ -52,7 +52,7 @@ AirBlender/
 │   │   ├── mappings.py               # CAMS (RACM/RADM2/MADE-SORGAM), MERRA-2 (4 presets), and EMAC tables
 │   │   └── salsa_remap.py            # Conservative 7-species x 10-bin WRF -> SALSA remapper
 │   ├── regrid/
-│   │   └── wrf_regrid.py             # Horizontal RegularGrid + log-P vertical & BC interpolation
+│   │   └── wrf_regrid.py             # Vectorized log-P vertical & cached bilinear horizontal/BC interp (4.12x cams2wrf)
 │   └── utils/
 │       ├── time_io.py                # Native datetime/char Times parsing & eta pressure derivation
 │       └── config_io.py              # YAML loader & ${VAR:-default} path expansion
@@ -61,7 +61,7 @@ AirBlender/
 ├── emac2wrf_main.py                  # Backwards-compatible CLI wrapper
 ├── scripts/merra2/                   # Legacy MERRA-2 wget shell scripts & README
 └── tests/
-    └── test_airblender.py            # Synthetic verification suite (Tests 1–8)
+    └── test_airblender.py            # Synthetic & performance verification suite (Tests 1–9)
 ```
 
 ---
