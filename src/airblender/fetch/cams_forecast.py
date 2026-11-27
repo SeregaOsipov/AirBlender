@@ -602,8 +602,32 @@ def _write_ds_streaming(ds_out: xr.Dataset, target_fp: str) -> None:
                 pass
 
 
-def _existing_nc_steps(fp: str, time_dim: str | None) -> int:
+def _nc_matches_reference_date(fp: str, expected_ref_date: str | None) -> bool:
+    if expected_ref_date is None:
+        return True
+    try:
+        with netCDF4.Dataset(fp, "r") as nc_chk:
+            if "forecast_reference_time" not in nc_chk.variables:
+                return True
+            ref_var = nc_chk.variables["forecast_reference_time"]
+            units = getattr(ref_var, "units", None)
+            if not units:
+                return False
+            decoded = netCDF4.num2date(
+                ref_var[:],
+                units=units,
+                calendar=getattr(ref_var, "calendar", "standard"),
+            )
+            first_ref = np.asarray(decoded).reshape(-1)[0]
+            return first_ref.strftime("%Y%m%d") == expected_ref_date
+    except Exception:
+        return False
+
+
+def _existing_nc_steps(fp: str, time_dim: str | None, expected_ref_date: str | None = None) -> int:
     if not os.path.exists(fp):
+        return 0
+    if expected_ref_date is not None and not _nc_matches_reference_date(fp, expected_ref_date):
         return 0
     try:
         with netCDF4.Dataset(fp, "r") as nc_chk:
@@ -641,10 +665,19 @@ def save_dataset_daily_and_base(
         unique_days = [date_str]
 
     time_dim = "forecast_period" if "forecast_period" in ds.dims else ("time" if "time" in ds.dims else None)
+    expected_ref = (
+        date_str
+        if (
+            "forecast_reference_time" in ds.coords
+            or "forecast_reference_time" in ds.dims
+            or "forecast_reference_time" in ds.variables
+        )
+        else None
+    )
     if no_split_days or len(unique_days) <= 1:
         out_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
         n_steps = ds.sizes.get(time_dim, 1) if time_dim else 1
-        if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim) >= n_steps:
+        if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim, expected_ref_date=expected_ref) >= n_steps:
             return
         _write_ds_streaming(ds, out_fp)
         log_msg(f"[SAVED] {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
@@ -657,13 +690,13 @@ def save_dataset_daily_and_base(
             else:
                 ds_day = ds
             n_steps = ds_day.sizes.get(time_dim, 1) if time_dim else 1
-            if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim) >= n_steps:
+            if skip_if_steps_ge and _existing_nc_steps(out_fp, time_dim, expected_ref_date=expected_ref) >= n_steps:
                 continue
             _write_ds_streaming(ds_day, out_fp)
             log_msg(f"[SAVED-DAILY] {day} ({n_steps} timesteps) -> {out_fp} ({os.path.getsize(out_fp) / (1024**2):.2f} MB)")
 
         base_fp = os.path.join(root, f"ECMWF-CAMS_{stream}_{date_str}.nc")
-        if not os.path.exists(base_fp):
+        if not os.path.exists(base_fp) or (expected_ref and not _nc_matches_reference_date(base_fp, expected_ref)):
             _write_ds_streaming(ds, base_fp)
             log_msg(f"[SAVED-BASE] {base_fp}")
 
@@ -909,15 +942,22 @@ def generate_tasks(args: argparse.Namespace) -> list[dict]:
         else:
             expected_days = [date_str]
 
-        sfc_done = all(
-            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_sfc_{d}.nc")) for d in expected_days
-        )
-        ml_done = all(
-            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_ml_{d}.nc")) for d in expected_days
-        )
-        ghg_done = all(
-            os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_ghg_{d}.nc")) for d in expected_days
-        )
+        def _stream_done(stream_name: str) -> bool:
+            if str(args.type).lower() != "forecast":
+                return all(
+                    os.path.exists(os.path.join(args.data_root_folder, f"ECMWF-CAMS_{stream_name}_{d}.nc"))
+                    for d in expected_days
+                )
+            for idx, d in enumerate(expected_days):
+                fp = os.path.join(args.data_root_folder, f"ECMWF-CAMS_{stream_name}_{d}.nc")
+                min_steps = 8 if (len(expected_days) > 1 and idx < len(expected_days) - 1) else 1
+                if _existing_nc_steps(fp, "forecast_period", expected_ref_date=date_str) < min_steps:
+                    return False
+            return True
+
+        sfc_done = _stream_done("sfc")
+        ml_done = _stream_done("ml")
+        ghg_done = _stream_done("ghg")
 
         ghg_only = bool(getattr(args, "ghg_only", False))
         need_sfc = (not ghg_only) and (args.force or not sfc_done)
